@@ -10,6 +10,8 @@
 			href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=M+PLUS+1p:wght@400;500;700&display=swap"
 			rel="stylesheet"
 		/>
+		<!-- PDF.js -->
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 		<style>
 			:root {
 				--bg-color: #f5f5f5;
@@ -522,6 +524,97 @@
 					display: flex;
 				}
 			}
+
+			/* PDF Preview Styles */
+			.pdf-preview-container {
+				width: 100%;
+				height: 100%;
+				display: flex;
+				flex-direction: column;
+				padding: 16px;
+				box-sizing: border-box;
+			}
+
+			.pdf-controls {
+				display: flex;
+				justify-content: center;
+				align-items: center;
+				gap: 8px;
+				margin-bottom: 12px;
+				padding: 8px;
+				background: rgba(0, 0, 0, 0.05);
+				border-radius: 4px;
+			}
+
+			.pdf-controls button {
+				background: var(--button-bg);
+				color: white;
+				border: none;
+				border-radius: 3px;
+				padding: 4px 8px;
+				font-size: 11px;
+				cursor: pointer;
+				transition: background 0.2s;
+			}
+
+			.pdf-controls button:hover {
+				background: var(--button-hover);
+			}
+
+			.pdf-controls button:disabled {
+				background: var(--button-disabled);
+				cursor: not-allowed;
+			}
+
+			.pdf-page-info {
+				font-size: 11px;
+				color: var(--muted);
+				margin: 0 8px;
+			}
+
+			.pdf-canvas-container {
+				flex: 1;
+				display: flex;
+				justify-content: center;
+				align-items: center;
+				overflow: auto;
+				background: #f8f8f8;
+				border: 1px solid var(--panel-border);
+				border-radius: 4px;
+				position: relative;
+			}
+
+			.pdf-canvas {
+				border: 1px solid #ddd;
+				box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+				background: white;
+				cursor: crosshair;
+			}
+
+			.pdf-loading {
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				flex-direction: column;
+				color: var(--muted);
+				gap: 8px;
+			}
+
+			.pdf-error {
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				flex-direction: column;
+				color: #dc3545;
+				gap: 8px;
+			}
+
+			.pdf-info {
+				text-align: center;
+				font-size: 12px;
+				color: var(--muted);
+				margin-top: 8px;
+			}
 		</style>
 	</head>
 	<body>
@@ -1010,6 +1103,29 @@
 				imageRect: null
 			};
 
+			// PDF state
+			let pdfState = {
+				pdfDoc: null,
+				currentPage: 1,
+				totalPages: 0,
+				scale: 1.0,
+				pageWidth: 0,
+				pageHeight: 0,
+				canvas: null,
+				overlayCanvas: null,
+				context: null,
+				overlayContext: null,
+				image: null,
+				isLoading: false,
+				selectionRect: null,
+				isSelecting: false,
+				startX: 0,
+				startY: 0,
+				currentX: 0,
+				currentY: 0,
+				renderingPage: false
+			};
+
 			// UI Functions
 			function showSettings() {
 				settingsPanel.classList.add('open');
@@ -1037,6 +1153,9 @@
 				
 				fileDropText.textContent = "ファイルを開いてください";
 				viewerPanel.innerHTML = '<div class="viewer-content">読み込み済みファイルをここでプレビューします</div>';
+				
+				// Clean up PDF state when no file is selected
+				cleanupPDFState();
 			}
 
 			function updateViewerPreview(file) {
@@ -1048,6 +1167,7 @@
 
 				// Check if it's an image file
 				if (fileType.startsWith('image/')) {
+					cleanupPDFState();
 					const reader = new FileReader();
 					reader.onload = function(e) {
 						// Create container with canvas overlay for selection
@@ -1061,12 +1181,6 @@
 										 style="position: absolute; top: 0; left: 0; cursor: crosshair; pointer-events: all;"
 										 width="0" height="0"></canvas>
 								</div>
-								<div style="font-size: 12px; color: #666; margin-top: 12px;">
-									<div><strong>${fileName}</strong></div>
-									<div>サイズ: ${fileSize} MB | タイプ: ${fileType}</div>
-									<div style="margin-top: 8px; color: #4a90e2;">ドラッグで範囲を選択してOCR実行</div>
-									<div id="selectionInfo" style="margin-top: 4px; color: #666; font-size: 11px;">範囲を選択すると座標が表示されます</div>
-								</div>
 							</div>
 						`;
 						// Setup selection after image loads
@@ -1076,22 +1190,11 @@
 				} 
 				// PDF file
 				else if (fileType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')) {
-					viewerPanel.innerHTML = `
-						<div class="viewer-content" style="padding: 16px; text-align: center;">
-							<div style="font-size: 48px; color: #ccc; margin-bottom: 16px;">📄</div>
-							<div style="font-size: 14px; color: #333; margin-bottom: 8px;">
-								<strong>PDF ファイル</strong>
-							</div>
-							<div style="font-size: 12px; color: #666;">
-								<div>${fileName}</div>
-								<div>サイズ: ${fileSize} MB</div>
-								<div style="margin-top: 12px; color: #4a90e2;">OCR実行でファイルを解析します</div>
-							</div>
-						</div>
-					`;
+					loadPDFPreview(file, fileName, fileSize);
 				}
 				// Other file types
 				else {
+					cleanupPDFState();
 					viewerPanel.innerHTML = `
 						<div class="viewer-content" style="padding: 16px; text-align: center;">
 							<div style="font-size: 48px; color: #ccc; margin-bottom: 16px;">📎</div>
@@ -1297,11 +1400,8 @@
 							viewerContent.appendChild(overlay);
 						}
 					} else {
-						// プレビューがない場合は再表示してからオーバーレイ
-						updateViewerPreview(fileInput.files[0]);
-						setTimeout(() => {
-							renderLoading(message); // 再帰呼び出しで再試行
-						}, 100);
+						// プレビューがない場合はシンプルなローディング表示
+						viewerPanel.innerHTML = `<div class="viewer-content" style="padding: 16px; text-align: center; color: #666;">${message}</div>`;
 					}
 				} else {
 					viewerPanel.innerHTML = '<div class="viewer-content">処理中...</div>';
@@ -1340,14 +1440,7 @@
 					overlay.remove();
 				}
 				
-				// Restore file preview if file is selected
-				if (fileInput && fileInput.files && fileInput.files.length > 0) {
-					const currentViewerContent = viewerPanel.innerHTML;
-					// Only restore if current content doesn't contain preview image
-					if (!currentViewerContent.includes('previewImage')) {
-						updateViewerPreview(fileInput.files[0]);
-					}
-				}
+				// プレビューの復元はOCR完了後に明示的に行う（無限ループ防止）
 			}
 
 			function createRequestId() {
@@ -1368,8 +1461,20 @@
 				stopProgressPolling();
 				const poll = async () => {
 					try {
+						if (!activeRequestId || activeRequestId !== requestId) {
+							// Request was cancelled or changed
+							stopProgressPolling();
+							return;
+						}
+
 						const res = await fetch(`/api/progress/${encodeURIComponent(requestId)}`);
-						if (!res.ok) return;
+						if (!res.ok) {
+							if (res.status === 404) {
+								// Request not found, likely completed
+								stopProgressPolling();
+							}
+							return;
+						}
 
 						const payload = await res.json();
 						const message = payload.message || "解析中...";
@@ -1384,11 +1489,11 @@
 							stopProgressPolling();
 						}
 					} catch (error) {
-						// Keep silent during transient polling errors.
+						// Silent error during polling
 					}
 				};
 				poll();
-				progressPollTimer = setInterval(poll, 500);
+				progressPollTimer = setInterval(poll, 1000); // Increased interval to 1 second
 			}
 
 			function renderPageSelector(results) {
@@ -1644,6 +1749,8 @@
 					updateViewerPreview(fileInput.files[0]);
 				} else {
 					viewerPanel.innerHTML = '<div class="viewer-content">読み込み済みファイルをここでプレビューします</div>';
+					// Clear PDF state and cleanup
+					cleanupPDFState();
 				}
 				pageSelect.innerHTML = "";
 				pagePickerWrap.classList.add("hidden");
@@ -1651,6 +1758,37 @@
 				currentResults = [];
 				activeRequestId = null;
 				statusIndicator.textContent = "待機中";
+			}
+
+			function cleanupPDFState() {
+				// Cleanup PDF document
+				if (pdfState.pdfDoc) {
+					try {
+						pdfState.pdfDoc.destroy();
+					} catch (e) {
+						// Ignore cleanup errors
+					}
+				}
+				
+				// Remove keyboard event listener
+				document.removeEventListener('keydown', handlePDFKeydown);
+				
+				// Reset state
+				pdfState.pdfDoc = null;
+				pdfState.currentPage = 1;
+				pdfState.totalPages = 0;
+				pdfState.scale = 1.0;
+				pdfState.pageWidth = 0;
+				pdfState.pageHeight = 0;
+				pdfState.canvas = null;
+				pdfState.overlayCanvas = null;
+				pdfState.context = null;
+				pdfState.overlayContext = null;
+				pdfState.image = null;
+				pdfState.isLoading = false;
+				pdfState.selectionRect = null;
+				pdfState.isSelecting = false;
+				pdfState.renderingPage = false;
 			}
 
 			// Image Selection Functions
@@ -1690,11 +1828,13 @@
 			function setupSelectionEvents() {
 				const canvas = selectionState.canvas;
 				if (!canvas) return;
+				if (canvas.dataset.bound === 'true') return;
 
 				canvas.addEventListener('mousedown', handleSelectionStart);
 				canvas.addEventListener('mousemove', handleSelectionMove);
 				canvas.addEventListener('mouseup', handleSelectionEnd);
 				canvas.addEventListener('mouseleave', handleSelectionEnd);
+				canvas.dataset.bound = 'true';
 			}
 
 			function handleSelectionStart(event) {
@@ -1807,21 +1947,24 @@
 
 			function updateSelectionInfo() {
 				const infoElement = document.getElementById('selectionInfo');
-				if (!infoElement) return;
 				
 				if (selectionState.selectionRect) {
 					const rect = selectionState.selectionRect;
 					const actualCoords = getActualImageCoords(rect);
-					infoElement.innerHTML = `選択範囲: ${Math.round(actualCoords.x1)}, ${Math.round(actualCoords.y1)} → ${Math.round(actualCoords.x2)}, ${Math.round(actualCoords.y2)} (${Math.round(actualCoords.width)}×${Math.round(actualCoords.height)})`;
-					infoElement.style.color = '#4a90e2';
+					if (infoElement) {
+						infoElement.innerHTML = `選択範囲: ${Math.round(actualCoords.x1)}, ${Math.round(actualCoords.y1)} → ${Math.round(actualCoords.x2)}, ${Math.round(actualCoords.y2)} (${Math.round(actualCoords.width)}×${Math.round(actualCoords.height)})`;
+						infoElement.style.color = '#4a90e2';
+					}
 					
 					// Show clear selection button
 					if (clearSelectionBtn) {
 						clearSelectionBtn.style.display = 'block';
 					}
 				} else {
-					infoElement.textContent = '範囲を選択すると座標が表示されます';
-					infoElement.style.color = '#666';
+					if (infoElement) {
+						infoElement.textContent = '範囲を選択すると座標が表示されます';
+						infoElement.style.color = '#666';
+					}
 					
 					// Hide clear selection button
 					if (clearSelectionBtn) {
@@ -1880,13 +2023,25 @@
 
 				// Add selection crop region if available
 				if (selectionState.selectionRect && selectionState.image) {
-					const actualCoords = getActualImageCoords(selectionState.selectionRect);
-					formData.append("crop_region", JSON.stringify({
-						x1: Math.round(actualCoords.x1),
-						y1: Math.round(actualCoords.y1),
-						x2: Math.round(actualCoords.x2),
-						y2: Math.round(actualCoords.y2)
-					}));
+					const isPdfFile = fileInput.files[0].type === 'application/pdf' || fileInput.files[0].name.toLowerCase().endsWith('.pdf');
+					if (isPdfFile && pdfState.pdfDoc) {
+						const actualCoords = getPDFActualCoords(selectionState.selectionRect);
+						formData.append("crop_region", JSON.stringify({
+							x1: Math.round(actualCoords.x1),
+							y1: Math.round(actualCoords.y1),
+							x2: Math.round(actualCoords.x2),
+							y2: Math.round(actualCoords.y2),
+							page: pdfState.currentPage
+						}));
+					} else {
+						const actualCoords = getActualImageCoords(selectionState.selectionRect);
+						formData.append("crop_region", JSON.stringify({
+							x1: Math.round(actualCoords.x1),
+							y1: Math.round(actualCoords.y1),
+							x2: Math.round(actualCoords.x2),
+							y2: Math.round(actualCoords.y2)
+						}));
+					}
 				}
 
 				setBusy(true, "事前処理中");
@@ -2029,6 +2184,16 @@
 			}
 
 			// Initialize
+			// PDF.js setup
+			if (typeof pdfjsLib !== 'undefined') {
+				pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+			}
+			
+			// Cleanup on page unload (prevent memory leaks)
+			window.addEventListener('beforeunload', () => {
+				cleanupPDFState();
+			});
+			
 			toggleSchema();
 			toggleLayoutOptions();
 			setupHelpBubbles();
@@ -2040,6 +2205,328 @@
 				clearSelectionBtn.addEventListener("click", () => {
 					clearSelection();
 				});
+			}
+
+			// PDF Preview Functions
+			async function loadPDFPreview(file, fileName, fileSize) {
+				pdfState.isLoading = true;
+				
+				// Show initial loading UI
+				viewerPanel.innerHTML = `
+					<div class="pdf-preview-container">
+						<div class="pdf-loading">
+							<div>📄 PDFを読み込み中...</div>
+							<div style="font-size: 11px;">${fileName} (${fileSize} MB)</div>
+						</div>
+					</div>
+				`;
+
+				try {
+					// File size check
+					const maxSize = 50 * 1024 * 1024; // 50MB
+					if (file.size > maxSize) {
+						throw new Error(`ファイルサイズが大きすぎます (${fileSize} MB)。50MB以下のファイルを使用してください。`);
+					}
+
+					// PDF.js worker設定
+					if (typeof pdfjsLib !== 'undefined') {
+						pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+					}
+
+					// ArrayBufferに変換
+					const arrayBuffer = await file.arrayBuffer();
+
+					// PDFドキュメントを読み込み
+					const pdfDoc = await pdfjsLib.getDocument({
+						data: arrayBuffer,
+						cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+						cMapPacked: true,
+						standardFontDataUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/'
+					}).promise;
+					
+					pdfState.pdfDoc = pdfDoc;
+					pdfState.totalPages = pdfDoc.numPages;
+					pdfState.currentPage = 1;
+					pdfState.scale = 1.0;
+
+					// Page limit check
+					if (pdfDoc.numPages > 1000) {
+						throw new Error(`ページ数が多すぎます (${pdfDoc.numPages} ページ)。1000ページ以下のファイルを使用してください。`);
+					}
+
+					// UIを構築
+					setupPDFPreviewUI(fileName, fileSize);
+
+					// 最初のページを表示
+					setTimeout(() => {
+						renderPDFPage(1);
+					}, 100);
+					
+				} catch (error) {
+					console.error('PDF読み込みエラー:', error);
+					showPDFError(fileName, fileSize, error);
+				} finally {
+					pdfState.isLoading = false;
+				}
+			}
+
+			function setupPDFPreviewUI(fileName, fileSize) {
+				viewerPanel.innerHTML = `
+					<div class="pdf-preview-container">
+						<div class="pdf-controls">
+							<button id="pdfPrevPageBtn" ${pdfState.currentPage <= 1 ? 'disabled' : ''} title="前のページ（左矢印キー）">&larr;</button>
+							<span class="pdf-page-info">
+								<span id="pdfCurrentPage">${pdfState.currentPage}</span> / <span id="pdfTotalPages">${pdfState.totalPages}</span>
+							</span>
+							<button id="pdfNextPageBtn" ${pdfState.currentPage >= pdfState.totalPages ? 'disabled' : ''} title="次のページ（右矢印キー）">&rarr;</button>
+							<span style="margin-left: 16px;"></span>
+							<button id="pdfZoomOutBtn" ${pdfState.scale <= 0.5 ? 'disabled' : ''} title="縮小（Ctrl + -）">-</button>
+							<span class="pdf-page-info">
+								<span id="pdfZoomLevel">${Math.round(pdfState.scale * 100)}%</span>
+							</span>
+							<button id="pdfZoomInBtn" ${pdfState.scale >= 3.0 ? 'disabled' : ''} title="拡大（Ctrl + +）">+</button>
+							<button id="pdfFitBtn" style="margin-left: 8px;" title="画面に合わせる">Fit</button>
+						</div>
+						<div class="pdf-canvas-container">
+							<div style="position: relative; display: inline-block;">
+								<img id="previewImage" alt="PDFプレビュー" style="max-width: 100%; max-height: 100%; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; display: block;" />
+								<canvas id="selectionCanvas" style="position: absolute; top: 0; left: 0; cursor: crosshair; pointer-events: all;" width="0" height="0"></canvas>
+							</div>
+						</div>
+					</div>
+				`;
+
+				// イベントリスナーを設定
+				setupPDFEventListeners();
+			}
+
+			function setupPDFEventListeners() {
+				const prevBtn = document.getElementById('pdfPrevPageBtn');
+				const nextBtn = document.getElementById('pdfNextPageBtn');
+				const zoomOutBtn = document.getElementById('pdfZoomOutBtn');
+				const zoomInBtn = document.getElementById('pdfZoomInBtn');
+				const fitBtn = document.getElementById('pdfFitBtn');
+
+				if (prevBtn) {
+					prevBtn.addEventListener('click', () => {
+						if (pdfState.currentPage > 1 && !pdfState.renderingPage) {
+							pdfState.currentPage--;
+							renderPDFPage(pdfState.currentPage);
+						}
+					});
+				}
+
+				if (nextBtn) {
+					nextBtn.addEventListener('click', () => {
+						if (pdfState.currentPage < pdfState.totalPages && !pdfState.renderingPage) {
+							pdfState.currentPage++;
+							renderPDFPage(pdfState.currentPage);
+						}
+					});
+				}
+
+				if (zoomOutBtn) {
+					zoomOutBtn.addEventListener('click', () => {
+						if (!pdfState.renderingPage) {
+							pdfState.scale = Math.max(0.5, pdfState.scale - 0.1);
+							renderPDFPage(pdfState.currentPage);
+						}
+					});
+				}
+
+				if (zoomInBtn) {
+					zoomInBtn.addEventListener('click', () => {
+						if (!pdfState.renderingPage) {
+							pdfState.scale = Math.min(3.0, pdfState.scale + 0.1);
+							renderPDFPage(pdfState.currentPage);
+						}
+					});
+				}
+
+				if (fitBtn) {
+					fitBtn.addEventListener('click', () => {
+						if (!pdfState.renderingPage) {
+							fitPDFToContainer();
+						}
+					});
+				}
+
+				// キーボードショートカット
+				document.addEventListener('keydown', handlePDFKeydown);
+
+			}
+
+			function handlePDFKeydown(event) {
+				// PDFのプレビューがアクティブな時のみキーボードショートカットを有効化
+				if (!pdfState.pdfDoc || pdfState.renderingPage) return;
+
+				switch(event.key) {
+					case 'ArrowLeft':
+						if (pdfState.currentPage > 1) {
+							event.preventDefault();
+							pdfState.currentPage--;
+							renderPDFPage(pdfState.currentPage);
+						}
+						break;
+					case 'ArrowRight':
+						if (pdfState.currentPage < pdfState.totalPages) {
+							event.preventDefault();
+							pdfState.currentPage++;
+							renderPDFPage(pdfState.currentPage);
+						}
+						break;
+					case '=':
+					case '+':
+						if (event.ctrlKey || event.metaKey) {
+							event.preventDefault();
+							pdfState.scale = Math.min(3.0, pdfState.scale + 0.1);
+							renderPDFPage(pdfState.currentPage);
+						}
+						break;
+					case '-':
+						if (event.ctrlKey || event.metaKey) {
+							event.preventDefault();
+							pdfState.scale = Math.max(0.5, pdfState.scale - 0.1);
+							renderPDFPage(pdfState.currentPage);
+						}
+						break;
+				}
+			}
+
+			async function renderPDFPage(pageNum) {
+				if (!pdfState.pdfDoc || pdfState.isLoading || pdfState.renderingPage) return;
+
+				pdfState.renderingPage = true;
+
+				try {
+					const previewImage = document.getElementById('previewImage');
+					if (!previewImage) {
+						pdfState.renderingPage = false;
+						return;
+					}
+
+					const page = await pdfState.pdfDoc.getPage(pageNum);
+					const baseViewport = page.getViewport({ scale: 1.0 });
+					const viewport = page.getViewport({ scale: pdfState.scale });
+					const renderCanvas = document.createElement('canvas');
+					const renderContext2d = renderCanvas.getContext('2d');
+					renderCanvas.width = viewport.width;
+					renderCanvas.height = viewport.height;
+					
+					const renderContext = {
+						canvasContext: renderContext2d,
+						viewport: viewport
+					};
+					
+					const renderPromise = page.render(renderContext).promise;
+					const timeoutPromise = new Promise((_, reject) => {
+						setTimeout(() => reject(new Error('ページレンダリングがタイムアウトしました')), 10000);
+					});
+
+					await Promise.race([renderPromise, timeoutPromise]);
+
+					pdfState.pageWidth = baseViewport.width;
+					pdfState.pageHeight = baseViewport.height;
+					previewImage.src = renderCanvas.toDataURL('image/png');
+					setupImageSelection();
+					
+					pdfState.canvas = renderCanvas;
+					pdfState.context = renderContext2d;
+					pdfState.image = previewImage;
+					
+					// Clear previous selection when changing pages (without re-rendering)
+					clearSelection();
+					if (clearSelectionBtn) {
+						clearSelectionBtn.style.display = 'none';
+					}
+					
+					// UIを更新
+					updatePDFControls();
+					
+				} catch (error) {
+					console.error('PDFページレンダリングエラー:', error);
+					const previewImage = document.getElementById('previewImage');
+					if (previewImage) {
+						previewImage.removeAttribute('src');
+						previewImage.alt = 'ページの読み込みに失敗しました';
+					}
+				} finally {
+					pdfState.renderingPage = false;
+				}
+			}
+
+			function updatePDFControls() {
+				const currentPageSpan = document.getElementById('pdfCurrentPage');
+				const prevBtn = document.getElementById('pdfPrevPageBtn');
+				const nextBtn = document.getElementById('pdfNextPageBtn');
+				const zoomLevel = document.getElementById('pdfZoomLevel');
+				const zoomOutBtn = document.getElementById('pdfZoomOutBtn');
+				const zoomInBtn = document.getElementById('pdfZoomInBtn');
+
+				if (currentPageSpan) currentPageSpan.textContent = pdfState.currentPage;
+				if (prevBtn) prevBtn.disabled = pdfState.currentPage <= 1 || pdfState.renderingPage;
+				if (nextBtn) nextBtn.disabled = pdfState.currentPage >= pdfState.totalPages || pdfState.renderingPage;
+				if (zoomLevel) zoomLevel.textContent = `${Math.round(pdfState.scale * 100)}%`;
+				if (zoomOutBtn) zoomOutBtn.disabled = pdfState.scale <= 0.5 || pdfState.renderingPage;
+				if (zoomInBtn) zoomInBtn.disabled = pdfState.scale >= 3.0 || pdfState.renderingPage;
+			}
+
+			function fitPDFToContainer() {
+				const container = document.querySelector('.pdf-canvas-container');
+				if (!container || !pdfState.pdfDoc) return;
+
+				const containerRect = container.getBoundingClientRect();
+				const containerWidth = containerRect.width - 40; // padding
+				const containerHeight = containerRect.height - 40;
+
+				// 現在のページを取得してサイズを計算
+				pdfState.pdfDoc.getPage(pdfState.currentPage).then(page => {
+					const viewport = page.getViewport({ scale: 1.0 });
+					const scaleX = containerWidth / viewport.width;
+					const scaleY = containerHeight / viewport.height;
+					pdfState.scale = Math.min(scaleX, scaleY, 2.0); // 最大2倍まで
+					renderPDFPage(pdfState.currentPage);
+				});
+			}
+
+			function showPDFError(fileName, fileSize, error) {
+				const errorMessage = error.message || 'Unknown error';
+
+				viewerPanel.innerHTML = `
+					<div class="pdf-preview-container">
+						<div class="pdf-error">
+							<div style="font-size: 24px;">⚠️</div>
+							<div>PDFファイルの読み込みに失敗しました</div>
+							<div style="font-size: 11px; margin-top: 8px; color: #666;">
+								${errorMessage.length > 100 ? errorMessage.substring(0, 100) + '...' : errorMessage}
+							</div>
+							<div style="font-size: 12px; margin-top: 12px; color: #666;">
+								<div><strong>${fileName}</strong></div>
+								<div>サイズ: ${fileSize} MB</div>
+								<div style="margin-top: 8px; color: #4a90e2;">プレビューなしでOCR実行することはできます</div>
+							</div>
+						</div>
+					</div>
+				`;
+			}
+
+			function getPDFActualCoords(displayRect) {
+				if (!selectionState.image || !pdfState.pageWidth || !pdfState.pageHeight) return displayRect;
+				const dpiInput = document.getElementById('dpi');
+				const dpiValue = dpiInput ? Number(dpiInput.value) : 220;
+				const renderScale = Math.max(36, Number.isFinite(dpiValue) ? dpiValue : 220) / 72;
+
+				const scaleX = (pdfState.pageWidth * renderScale) / selectionState.image.offsetWidth;
+				const scaleY = (pdfState.pageHeight * renderScale) / selectionState.image.offsetHeight;
+				
+				return {
+					x1: displayRect.x1 * scaleX,
+					y1: displayRect.y1 * scaleY,
+					x2: displayRect.x2 * scaleX,
+					y2: displayRect.y2 * scaleY,
+					width: displayRect.width * scaleX,
+					height: displayRect.height * scaleY
+				};
 			}
 		</script>
 	</body>

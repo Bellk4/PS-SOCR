@@ -204,8 +204,16 @@ def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list
         pages: list[Image.Image] = []
         scale = max(36, int(dpi)) / 72.0
         doc = pdfium.PdfDocument(str(path))
+        selected_page = None
+        if crop_region is not None and crop_region.get("page") is not None:
+            try:
+                selected_page = max(1, int(crop_region["page"]))
+            except (TypeError, ValueError):
+                selected_page = None
         try:
             for page_index in range(len(doc)):
+                if selected_page is not None and (page_index + 1) != selected_page:
+                    continue
                 page = doc[page_index]
                 bitmap = page.render(scale=scale)
                 try:
@@ -866,6 +874,8 @@ async def analyze(
                 'x2': int(crop_data['x2']),
                 'y2': int(crop_data['y2'])
             }
+            if 'page' in crop_data and crop_data['page'] is not None:
+                parsed_crop_region['page'] = int(crop_data['page'])
 
             # Basic sanity check
             if (parsed_crop_region['x1'] >= parsed_crop_region['x2'] or
