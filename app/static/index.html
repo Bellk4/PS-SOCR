@@ -420,6 +420,10 @@
 				display: none;
 			}
 
+			.schema-wrap {
+				margin-top: 12px;
+			}
+
 			.text-center {
 				text-align: center;
 			}
@@ -655,7 +659,7 @@
 				
 				<div class="toolbar-group">
 					<button class="toolbar-btn" id="settingsBtn">詳細設定</button>
-					<button class="toolbar-btn" id="clearSelectionBtn" style="display: none;">選択解除</button>
+					<button class="toolbar-btn hidden" id="clearSelectionBtn">選択解除</button>
 				</div>
 			</div>
 			
@@ -688,6 +692,7 @@
 							type="file"
 							class="file-input-overlay"
 							accept=".pdf,image/*"
+							title="OCR対象ファイル"
 							required
 						/>
 					</div>
@@ -750,7 +755,7 @@
 										?
 									</button>
 								</label>
-								<select id="task" name="task">
+								<select id="task" name="task" title="認識タイプ">
 									<option value="text" selected>Text</option>
 									<option value="table">Table</option>
 									<option value="formula">Formula</option>
@@ -770,7 +775,7 @@
 										?
 									</button>
 								</label>
-								<select id="linebreak_mode" name="linebreak_mode">
+								<select id="linebreak_mode" name="linebreak_mode" title="改行処理">
 									<option value="none" selected>処理しない</option>
 									<option value="paragraph">段落整形（空行維持）</option>
 									<option value="compact">強力整形（改行ほぼ除去）</option>
@@ -789,7 +794,7 @@
 										?
 									</button>
 								</label>
-								<select id="device" name="device">
+								<select id="device" name="device" title="推論デバイス">
 									<option value="auto" selected>auto</option>
 									<option value="cuda">cuda</option>
 									<option value="cpu">cpu</option>
@@ -797,7 +802,7 @@
 							</div>
 						</div>
 						
-						<div class="form-field" id="schemaWrap" style="display: none; margin-top: 12px;">
+						<div class="form-field schema-wrap hidden" id="schemaWrap">
 							<label>
 								schema (JSON Schema string)
 								<button
@@ -832,7 +837,7 @@
 										?
 									</button>
 								</label>
-								<select id="use_layout" name="use_layout">
+								<select id="use_layout" name="use_layout" title="領域分割OCRの有効化">
 									<option value="false" selected>OFF (従来ページOCR)</option>
 									<option value="true">ON (PP-DocLayoutV3)</option>
 								</select>
@@ -850,7 +855,7 @@
 										?
 									</button>
 								</label>
-								<select id="layout_backend" name="layout_backend">
+								<select id="layout_backend" name="layout_backend" title="レイアウト解析バックエンド">
 									<option value="ppdoclayoutv3" selected>ppdoclayoutv3</option>
 									<option value="none">none</option>
 								</select>
@@ -868,7 +873,7 @@
 										?
 									</button>
 								</label>
-								<select id="reading_order" name="reading_order">
+								<select id="reading_order" name="reading_order" title="読取順序">
 									<option value="auto" selected>auto</option>
 									<option value="ltr_ttb">ltr_ttb</option>
 									<option value="rtl_ttb">rtl_ttb</option>
@@ -894,6 +899,7 @@
 									type="number"
 									min="0"
 									max="256"
+									title="領域余白ピクセル"
 									value="12"
 								/>
 							</div>
@@ -916,6 +922,7 @@
 									type="number"
 									min="1"
 									max="1000"
+									title="最大領域数"
 									value="200"
 								/>
 							</div>
@@ -938,6 +945,7 @@
 									type="number"
 									min="1"
 									max="8"
+									title="領域並列数"
 									value="1"
 								/>
 							</div>
@@ -965,6 +973,7 @@
 									type="number"
 									min="72"
 									max="600"
+									title="PDF解像度DPI"
 									value="220"
 								/>
 							</div>
@@ -987,6 +996,7 @@
 									type="number"
 									min="1"
 									max="32768"
+									title="最大生成トークン数"
 									value="1024"
 								/>
 							</div>
@@ -1010,6 +1020,7 @@
 									step="0.1"
 									min="0"
 									max="2"
+									title="生成温度"
 									value="0"
 								/>
 							</div>
@@ -1020,7 +1031,7 @@
 		</div>
 
 		<!-- Hidden elements for status -->
-		<div style="display: none">
+		<div class="hidden">
 			<span id="statusModel">model: -</span>
 			<span id="statusDevice">device: -</span>
 			<span id="statusCuda">cuda: -</span>
@@ -1031,8 +1042,8 @@
 			<span id="resultLayout">layout: -</span>
 			<span id="resultOrder">order: -</span>
 			<span id="requestNote">待機中</span>
-			<button id="submitBtn" type="submit" style="display: none;">実行</button>
-			<button id="cancelBtn" type="button" style="display: none;">中断</button>
+			<button id="submitBtn" type="submit" class="hidden">実行</button>
+			<button id="cancelBtn" type="button" class="hidden">中断</button>
 			<div id="resultBody"></div>
 		</div>
 
@@ -1052,6 +1063,7 @@
 			const zoomOutBtn = document.getElementById("zoomOut");
 			const zoomInBtn = document.getElementById("zoomIn");
 			const fitBtn = document.getElementById("fitBtn");
+			const zoomLevel = document.getElementById("zoomLevel");
 			const copyBtn = document.getElementById("copyBtn");
 			const statusIndicator = document.getElementById("statusIndicator");
 			const fileInput = document.getElementById("file");
@@ -1308,11 +1320,7 @@
 
 			function toggleSchema() {
 				const show = taskNeedsSchema(taskInput.value);
-				if (show) {
-					schemaWrap.style.display = "block";
-				} else {
-					schemaWrap.style.display = "none";
-				}
+				schemaWrap.classList.toggle("hidden", !show);
 				schemaInput.required = show;
 			}
 
@@ -2030,7 +2038,7 @@
 					
 					// Show clear selection button
 					if (clearSelectionBtn) {
-						clearSelectionBtn.style.display = 'block';
+						clearSelectionBtn.classList.remove("hidden");
 					}
 				} else {
 					if (infoElement) {
@@ -2040,7 +2048,7 @@
 					
 					// Hide clear selection button
 					if (clearSelectionBtn) {
-						clearSelectionBtn.style.display = 'none';
+						clearSelectionBtn.classList.add("hidden");
 					}
 				}
 			}
@@ -2472,7 +2480,7 @@
 					// Clear previous selection when changing pages (without re-rendering)
 					clearSelection();
 					if (clearSelectionBtn) {
-						clearSelectionBtn.style.display = 'none';
+						clearSelectionBtn.classList.add("hidden");
 					}
 					
 				} catch (error) {
