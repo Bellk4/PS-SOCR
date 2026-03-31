@@ -9,7 +9,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -24,7 +24,7 @@ from transformers import (
     StoppingCriteriaList,
 )
 
-from app.layout_ppdoclayoutv3 import LayoutBlock, detect_layout_blocks
+from .layout_ppdoclayoutv3 import LayoutBlock, detect_layout_blocks
 
 MODEL_ID = "zai-org/GLM-OCR"
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -49,6 +49,10 @@ logger = logging.getLogger("glm_ocr_server")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 
+_VIDEO_AUTO_PATCHED_MODULE_IDS: set[int] = set()
+
+# transformersのビデオ自動モジュールで、特定の環境でVIDEO_PROCESSOR_MAPPING_NAMESの値がNoneになる問題への互換パッチ
+
 
 def patch_transformers_video_auto_none_bug() -> None:
     try:
@@ -56,19 +60,22 @@ def patch_transformers_video_auto_none_bug() -> None:
     except Exception:
         return
 
-    if getattr(video_processing_auto, "_glm_none_patch_applied", False):
+    module_id = id(video_processing_auto)
+    if module_id in _VIDEO_AUTO_PATCHED_MODULE_IDS:
         return
 
     fixed = 0
     for key, value in list(video_processing_auto.VIDEO_PROCESSOR_MAPPING_NAMES.items()):
         if value is None:
-            video_processing_auto.VIDEO_PROCESSOR_MAPPING_NAMES[key] = ""
+            video_processing_auto.VIDEO_PROCESSOR_MAPPING_NAMES[key] = ("", "")
             fixed += 1
 
-    video_processing_auto._glm_none_patch_applied = True
+    _VIDEO_AUTO_PATCHED_MODULE_IDS.add(module_id)
     if fixed:
         logger.warning(
-            "Applied transformers video auto patch for %d entries", fixed)
+            "transformersビデオ自動パッチを %d 件に適用しました", fixed)
+
+# デバイス指定を解決するユーティリティ関数
 
 
 def resolve_device(device: str) -> str:
@@ -78,23 +85,27 @@ def resolve_device(device: str) -> str:
     if requested == "cuda":
         if not torch.cuda.is_available():
             logger.warning(
-                "CUDA requested but unavailable. Falling back to CPU.")
+                "CUDAが要求されましたが利用できません。CPUにフォールバックします。")
             return "cpu"
         return "cuda"
     if requested == "cpu":
         return requested
     raise HTTPException(
-        status_code=400, detail=f"Unsupported device: {device}")
+        status_code=400, detail=f"サポートされていないデバイス: {device}")
+
+# GLM-OCRのprocessor/modelを読み込み・再利用し、デバイス切替も管理するランタイム。
 
 
 class GlmRuntime:
+    # ランタイム状態（processor/model/現在デバイス）を初期化する。
     def __init__(self) -> None:
-        self.processor: Optional[AutoProcessor] = None
-        self.model: Optional[AutoModelForImageTextToText] = None
+        self.processor: Optional[Any] = None
+        self.model: Optional[Any] = None
         self.current_device: Optional[str] = None
         self._load_lock = asyncio.Lock()
 
-    def _load_model(self, device: str) -> AutoModelForImageTextToText:
+    # 指定デバイス向けにGLMモデルをロードして返す。
+    def _load_model(self, device: str) -> Any:
         if device == "cuda":
             try:
                 return AutoModelForImageTextToText.from_pretrained(
@@ -107,7 +118,7 @@ class GlmRuntime:
                 if "requires `accelerate`" not in str(exc):
                     raise
                 logger.warning(
-                    "accelerate is missing. Falling back to CUDA load without device_map."
+                    "accelerateがありません。device_mapなしでCUDA読み込みにフォールバックします。"
                 )
                 model = AutoModelForImageTextToText.from_pretrained(
                     MODEL_ID,
@@ -115,7 +126,7 @@ class GlmRuntime:
                     torch_dtype="auto",
                     device_map=None,
                 )
-                return model.to("cuda")
+                return cast(Any, model).to("cuda")
 
         model = AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
@@ -123,12 +134,13 @@ class GlmRuntime:
             torch_dtype=torch.float32,
             device_map=None,
         )
-        return model.to("cpu")
+        return cast(Any, model).to("cpu")
 
+    # processor/modelを必要に応じてロードし、要求デバイスへ揃える。
     async def ensure_loaded(self, device: str) -> None:
         async with self._load_lock:
             if self.processor is None:
-                logger.info("Loading processor: %s", MODEL_ID)
+                logger.info("プロセッサを読み込み中: %s", MODEL_ID)
                 patch_transformers_video_auto_none_bug()
                 try:
                     self.processor = AutoProcessor.from_pretrained(
@@ -138,14 +150,14 @@ class GlmRuntime:
                 except ImportError as exc:
                     if "Torchvision library" in str(exc):
                         raise RuntimeError(
-                            "torchvision is required by GLM-OCR processor. "
-                            "Install it with: pip install torchvision"
+                            "GLM-OCRプロセッサにはtorchvisionが必要です。"
+                            "pip install torchvision でインストールしてください。"
                         ) from exc
                     raise
                 except TypeError as exc:
                     if "NoneType" not in str(exc):
                         raise
-                    # Retry once after forcing the compatibility patch.
+                    # 互換パッチ強制適用後に一度リトライする
                     patch_transformers_video_auto_none_bug()
                     self.processor = AutoProcessor.from_pretrained(
                         MODEL_ID,
@@ -157,39 +169,38 @@ class GlmRuntime:
 
             if self.model is not None:
                 logger.info(
-                    "Switching model device from %s to %s", self.current_device, device
+                    "モデルデバイスを %s から %s に切り替えています", self.current_device, device
                 )
                 del self.model
                 self.model = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            logger.info("Loading model: %s (device=%s)", MODEL_ID, device)
+            logger.info("モデルを読み込み中: %s (デバイス=%s)", MODEL_ID, device)
             self.model = await asyncio.to_thread(self._load_model, device)
             self.current_device = device
 
-    def get(self) -> tuple[AutoProcessor, AutoModelForImageTextToText, str]:
+    # 初期化済みのprocessor/model/deviceを取得する。
+    def get(self) -> tuple[Any, Any, str]:
         if self.processor is None or self.model is None or self.current_device is None:
-            raise RuntimeError("GLM runtime is not initialized")
+            raise RuntimeError("GLMランタイムが初期化されていません")
         return self.processor, self.model, self.current_device
 
+# 画像ファイルやPDFファイルからページを読み込むユーティリティ関数
 
-def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list[Image.Image]:
+
+def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list[tuple[int, Image.Image]]:
+
+    # 単一ページ画像に対してcrop_regionを適用する。
+
     def apply_crop_if_needed(image: Image.Image) -> Image.Image:
-        """Apply crop to image if crop_region is specified"""
         if crop_region is None:
             return image
-
-        # Get image dimensions
         img_width, img_height = image.size
-
-        # Get crop coordinates (ensure they're within bounds)
         x1 = max(0, min(crop_region['x1'], img_width - 1))
         y1 = max(0, min(crop_region['y1'], img_height - 1))
         x2 = max(x1 + 1, min(crop_region['x2'], img_width))
         y2 = max(y1 + 1, min(crop_region['y2'], img_height))
-
-        # Apply crop
         return image.crop((x1, y1, x2, y2))
 
     suffix = path.suffix.lower()
@@ -198,10 +209,10 @@ def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list
             import pypdfium2 as pdfium
         except ImportError as exc:
             raise RuntimeError(
-                "pypdfium2 is required for PDF input. Install it with: pip install pypdfium2"
+                "PDF入力にはpypdfium2が必要です。pip install pypdfium2 でインストールしてください。"
             ) from exc
 
-        pages: list[Image.Image] = []
+        pages: list[tuple[int, Image.Image]] = []
         scale = max(36, int(dpi)) / 72.0
         doc = pdfium.PdfDocument(str(path))
         selected_page = None
@@ -214,17 +225,18 @@ def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list
             for page_index in range(len(doc)):
                 if selected_page is not None and (page_index + 1) != selected_page:
                     continue
-                page = doc[page_index]
-                bitmap = page.render(scale=scale)
+                source_page_num = page_index + 1
+                pdf_page = doc[page_index]
+                bitmap = cast(Any, pdf_page).render(scale=scale)
                 try:
                     image = bitmap.to_pil().convert("RGB")
                     image = apply_crop_if_needed(image)
                 finally:
                     if hasattr(bitmap, "close"):
                         bitmap.close()
-                    if hasattr(page, "close"):
-                        page.close()
-                pages.append(image)
+                    if hasattr(pdf_page, "close"):
+                        pdf_page.close()
+                pages.append((source_page_num, image))
         finally:
             if hasattr(doc, "close"):
                 doc.close()
@@ -233,7 +245,9 @@ def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list
     with Image.open(path) as image:
         converted_image = image.convert("RGB")
         cropped_image = apply_crop_if_needed(converted_image)
-        return [cropped_image]
+        return [(1, cropped_image)]
+
+# アップロード内容を一時ファイルへ保存し、パスを返す。
 
 
 def save_temp_upload(upload_name: str, content: bytes) -> Path:
@@ -241,6 +255,8 @@ def save_temp_upload(upload_name: str, content: bytes) -> Path:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(content)
         return Path(tmp.name)
+
+# PIL画像を一時PNGとして保存し、パスを返す。
 
 
 def save_temp_png(image: Image.Image) -> Path:
@@ -253,8 +269,11 @@ def save_temp_png(image: Image.Image) -> Path:
         raise
     return Path(tmp_path)
 
+# タスク種別に応じてモデルへ渡すプロンプト文字列を構築する。
+
 
 def build_prompt(task: str, schema: Optional[str]) -> str:
+
     if task == "text":
         return "Text Recognition:"
     if task == "table":
@@ -265,13 +284,14 @@ def build_prompt(task: str, schema: Optional[str]) -> str:
         if not schema:
             raise HTTPException(
                 status_code=400,
-                detail="schema is required when task=extract_json",
+                detail="task=extract_jsonの場合、schemaが必要です",
             )
-        # Align with the prompt style in the official model card.
-        return f"请按下列JSON格式输出图中信息:\n{schema}"
-    raise HTTPException(status_code=400, detail=f"Unsupported task: {task}")
+        # 公式モデルカードのプロンプトスタイルに合わせる
+        return f"以下のJSON形式で画像中の情報を出力してください:\n{schema}"
+    raise HTTPException(status_code=400, detail=f"サポートされていないタスク: {task}")
 
 
+# 文字がCJK（日本語・中国語系）かどうかを判定する。
 def is_cjk_char(ch: str) -> bool:
     if not ch:
         return False
@@ -284,6 +304,7 @@ def is_cjk_char(ch: str) -> bool:
     )
 
 
+# 改行折り返しされた2行を、文字種に応じて自然に連結する。
 def join_soft_wrapped_line(left: str, right: str) -> str:
     if not left:
         return right
@@ -294,6 +315,7 @@ def join_soft_wrapped_line(left: str, right: str) -> str:
     return f"{left} {right}"
 
 
+# 行結合時に改行を維持すべき境界かを判定する。
 def is_hard_break(left: str, right: str) -> bool:
     if not left or not right:
         return True
@@ -306,6 +328,7 @@ def is_hard_break(left: str, right: str) -> bool:
     return False
 
 
+# 指定モード（none/paragraph/compact）で改行を正規化する。
 def normalize_linebreaks(text: str, mode: str) -> str:
     normalized_mode = (mode or "none").strip().lower()
     if normalized_mode == "none" or not text:
@@ -335,17 +358,18 @@ def normalize_linebreaks(text: str, mode: str) -> str:
         non_empty = [line.strip() for line in lines if line.strip()]
         if not non_empty:
             return ""
-        merged = non_empty[0]
+        merged_text: str = non_empty[0]
         for line in non_empty[1:]:
-            merged = join_soft_wrapped_line(merged, line)
-        return merged.strip()
+            merged_text = join_soft_wrapped_line(merged_text, line)
+        return merged_text.strip()
 
     raise HTTPException(
         status_code=400,
-        detail=f"Unsupported linebreak_mode: {mode}",
+        detail=f"サポートされていない改行モード: {mode}",
     )
 
 
+# 数字を対応する丸数字Unicodeへ変換する。
 def circled_number(num: int) -> Optional[str]:
     if num == 0:
         return "⓪"
@@ -358,6 +382,7 @@ def circled_number(num: int) -> Optional[str]:
     return None
 
 
+# TeXの\textcircled記法を丸数字へ置換する。
 def normalize_textcircled_notation(text: str) -> str:
     if not text:
         return text
@@ -369,12 +394,13 @@ def normalize_textcircled_notation(text: str) -> str:
         symbol = circled_number(int(raw))
         return symbol or match.group(0)
 
-    # Convert both "$\\textcircled{1}$" and "\\textcircled{1}".
+    # "$\\textcircled{1}$" と "\\textcircled{1}" の両形式を変換する
     text = re.sub(r"\$\s*\\textcircled\{(\d+)\}\s*\$", replace_match, text)
     text = re.sub(r"\\textcircled\{(\d+)\}", replace_match, text)
     return text
 
 
+# OCR出力テキストへタスク別の正規化処理を適用する。
 def normalize_text_output(text: str, task: str, linebreak_mode: str) -> str:
     normalized = text
     if task in {"text", "table"}:
@@ -382,6 +408,7 @@ def normalize_text_output(text: str, task: str, linebreak_mode: str) -> str:
     return normalize_linebreaks(normalized, linebreak_mode)
 
 
+# bboxへ余白を付けつつ、画像範囲内へクリップする。
 def clamp_bbox_with_padding(
     bbox: tuple[int, int, int, int],
     image: Image.Image,
@@ -401,10 +428,12 @@ def clamp_bbox_with_padding(
     return (x1, y1, x2, y2)
 
 
+# bboxタプルをAPI返却用dict形式へ変換する。
 def bbox_dict(bbox: tuple[int, int, int, int]) -> dict[str, int]:
     return {"x1": int(bbox[0]), "y1": int(bbox[1]), "x2": int(bbox[2]), "y2": int(bbox[3])}
 
 
+# レイアウト検出ラベルをOCR処理用の正規化ラベルへ寄せる。
 def normalize_layout_label(block_type: str) -> str:
     lowered = (block_type or "text").strip().lower()
     if lowered in {"formula", "equation"}:
@@ -416,6 +445,7 @@ def normalize_layout_label(block_type: str) -> str:
     return lowered or "text"
 
 
+# auto指定時に領域形状・配置から実効読順を推定する。
 def resolve_effective_reading_order(
     blocks: list[LayoutBlock],
     requested_order: str,
@@ -442,11 +472,12 @@ def resolve_effective_reading_order(
     if tall_ratio > 0.55 and narrow_ratio > 0.45:
         return "vertical_rl"
     if multi_column:
-        # For Japanese multi-column documents, right-to-left column order is common.
+        # 日本語の段組み文書では、右から左への段組み順が一般的
         return "rtl_ttb"
     return "ltr_ttb"
 
 
+# 横書き向けに行単位へグルーピングし、左右順で並べ替える。
 def sort_blocks_ltr_or_rtl(
     blocks: list[LayoutBlock],
     rtl: bool,
@@ -476,6 +507,7 @@ def sort_blocks_ltr_or_rtl(
     return ordered
 
 
+# 縦書き右列優先向けに列単位へグルーピングして上から並べる。
 def sort_blocks_vertical_rl(blocks: list[LayoutBlock]) -> list[LayoutBlock]:
     if not blocks:
         return []
@@ -502,6 +534,7 @@ def sort_blocks_vertical_rl(blocks: list[LayoutBlock]) -> list[LayoutBlock]:
     return ordered
 
 
+# 読順設定に応じて適切なソート関数へ振り分ける。
 def sort_layout_blocks(blocks: list[LayoutBlock], reading_order: str) -> list[LayoutBlock]:
     if reading_order == "vertical_rl":
         return sort_blocks_vertical_rl(blocks)
@@ -510,6 +543,7 @@ def sort_layout_blocks(blocks: list[LayoutBlock], reading_order: str) -> list[La
     return sort_blocks_ltr_or_rtl(blocks, rtl=False)
 
 
+# 領域タイプと全体タスクから領域単位の推論プロンプトを決定する。
 def block_prompt_for_task(global_task: str, block_type: str, schema: Optional[str]) -> str:
     if global_task != "text":
         return build_prompt(global_task, schema)
@@ -521,6 +555,7 @@ def block_prompt_for_task(global_task: str, block_type: str, schema: Optional[st
     return build_prompt("text", None)
 
 
+# 領域ごとのOCR文字列を結合し、改行モードを適用した本文を作る。
 def combine_block_texts(blocks: list[dict[str, Any]], linebreak_mode: str) -> str:
     parts: list[str] = []
     for block in blocks:
@@ -541,6 +576,7 @@ def combine_block_texts(blocks: list[dict[str, Any]], linebreak_mode: str) -> st
     return normalize_linebreaks(combined, linebreak_mode)
 
 
+# レイアウト領域の矩形を描画したプレビュー画像をbase64で返す。
 def build_layout_preview_base64(
     page: Image.Image,
     blocks: list[dict[str, Any]],
@@ -565,9 +601,10 @@ def build_layout_preview_base64(
     return encoded
 
 
+# 単一画像に対してGLM推論を実行し、raw/clean文字列とtruncatedを返す。
 def glm_infer(
-    processor: AutoProcessor,
-    model: AutoModelForImageTextToText,
+    processor: Any,
+    model: Any,
     image_path: str,
     prompt: str,
     max_new_tokens: int,
@@ -621,6 +658,7 @@ MAX_PROGRESS_ENTRIES = 300
 CANCEL_REQUESTS: set[str] = set()
 
 
+# リクエスト進捗状態を保存し、上限を超えた古い履歴を間引く。
 def set_progress(
     request_id: str,
     state: str,
@@ -641,7 +679,7 @@ def set_progress(
         "updated_at": time.time(),
     }
     if len(PROGRESS_STATE) > MAX_PROGRESS_ENTRIES:
-        # Keep memory bounded by removing the oldest entries.
+        # 古いエントリを削除してメモリを制限する
         oldest = sorted(PROGRESS_STATE.items(), key=lambda item: item[1]["updated_at"])[
             : len(PROGRESS_STATE) - MAX_PROGRESS_ENTRIES
         ]
@@ -649,14 +687,18 @@ def set_progress(
             PROGRESS_STATE.pop(key, None)
 
 
+# 指定リクエストに中断要求が出ているかを返す。
 def is_cancel_requested(request_id: str) -> bool:
     return request_id in CANCEL_REQUESTS
 
 
+# 生成中に中断要求フラグを監視し、トークン生成を停止するStoppingCriteria。
 class CancelStoppingCriteria(StoppingCriteria):
+    # 中断監視対象のrequest_idを保持する。
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
 
+    # 生成ループ中に中断要求を検知したらTrueを返して停止させる。
     def __call__(
         self,
         input_ids: torch.LongTensor,
@@ -666,10 +708,12 @@ class CancelStoppingCriteria(StoppingCriteria):
         return is_cancel_requested(self.request_id)
 
 
+# 中断要求フラグをクリアする。
 def clear_cancel_request(request_id: str) -> None:
     CANCEL_REQUESTS.discard(request_id)
 
 
+# 中断要求を受け付け、進捗状態をcancel_requestedへ更新する。
 def request_cancel(request_id: str) -> dict[str, Any]:
     item = PROGRESS_STATE.get(request_id)
     if item is not None:
@@ -726,29 +770,32 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.on_event("startup")
+# サーバー起動時にモデルキャッシュを準備し、既定デバイスで初期ロードする。
 async def startup_load_model() -> None:
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     default_device = resolve_device("auto")
     await RUNTIME.ensure_loaded(default_device)
     logger.info(
-        "Startup complete (device=%s, cache_dir=%s)",
+        "起動完了 (デバイス=%s, キャッシュディレクトリ=%s)",
         default_device,
         MODEL_CACHE_DIR,
     )
 
 
 @app.get("/", response_class=HTMLResponse)
+# UI本体（index.html）を返す。
 async def index() -> HTMLResponse:
     html_path = static_dir / "index.html"
     if not html_path.exists():
         raise HTTPException(
             status_code=500,
-            detail="UI not found. Ensure app/static/index.html exists.",
+            detail="UIが見つかりません。app/static/index.htmlが存在することを確認してください。",
         )
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
 @app.get("/api/status")
+# 実行環境状態（CUDA可否・既定デバイス・モデル情報）を返す。
 async def status() -> dict[str, Any]:
     return {
         "cuda_available": torch.cuda.is_available(),
@@ -759,19 +806,22 @@ async def status() -> dict[str, Any]:
 
 
 @app.get("/api/progress/{request_id}")
+# request_id単位の進捗状態を返す。
 async def progress(request_id: str) -> dict[str, Any]:
     item = PROGRESS_STATE.get(request_id)
     if item is None:
-        raise HTTPException(status_code=404, detail="progress not found")
+        raise HTTPException(status_code=404, detail="進捗情報が見つかりません")
     return item
 
 
 @app.post("/api/cancel/{request_id}")
+# 指定リクエストへ中断要求を送る。
 async def cancel(request_id: str) -> dict[str, Any]:
     return request_cancel(request_id)
 
 
 @app.post("/api/analyze")
+# OCRリクエストを受け取り、前処理・推論・後処理を実行して結果を返す。
 async def analyze(
     file: UploadFile = File(...),
     device: str = Form("auto"),
@@ -796,20 +846,20 @@ async def analyze(
 
     normalized_task = (task or "text").strip().lower()
     if normalized_task not in ALLOWED_TASKS:
-        set_progress(request_id, "error", f"Unsupported task: {task}", 0, 0)
+        set_progress(request_id, "error", f"サポートされていないタスク: {task}", 0, 0)
         raise HTTPException(
-            status_code=400, detail=f"Unsupported task: {task}")
+            status_code=400, detail=f"サポートされていないタスク: {task}")
     normalized_linebreak_mode = (linebreak_mode or "none").strip().lower()
     if normalized_linebreak_mode not in ALLOWED_LINEBREAK_MODES:
         set_progress(
             request_id,
             "error",
-            f"Unsupported linebreak_mode: {linebreak_mode}",
+            f"サポートされていない改行モード: {linebreak_mode}",
             0,
             0,
         )
         raise HTTPException(
-            status_code=400, detail=f"Unsupported linebreak_mode: {linebreak_mode}"
+            status_code=400, detail=f"サポートされていない改行モード: {linebreak_mode}"
         )
     normalized_layout_backend = (
         layout_backend or DEFAULT_LAYOUT_BACKEND).strip().lower()
@@ -817,13 +867,13 @@ async def analyze(
         set_progress(
             request_id,
             "error",
-            f"Unsupported layout_backend: {layout_backend}",
+            f"サポートされていないレイアウトバックエンド: {layout_backend}",
             0,
             0,
         )
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported layout_backend: {layout_backend}",
+            detail=f"サポートされていないレイアウトバックエンド: {layout_backend}",
         )
     normalized_reading_order = (
         reading_order or DEFAULT_READING_ORDER).strip().lower()
@@ -831,13 +881,13 @@ async def analyze(
         set_progress(
             request_id,
             "error",
-            f"Unsupported reading_order: {reading_order}",
+            f"サポートされていない読み取り順: {reading_order}",
             0,
             0,
         )
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported reading_order: {reading_order}",
+            detail=f"サポートされていない読み取り順: {reading_order}",
         )
 
     normalized_dpi = max(36, min(600, int(dpi or DEFAULT_DPI)))
@@ -853,21 +903,21 @@ async def analyze(
     )
     use_layout_mode = bool(use_layout)
 
-    # Parse crop region if provided
+    # crop_regionが指定されている場合はパースする
     parsed_crop_region = None
     if crop_region and crop_region.strip():
         try:
             crop_data = json.loads(crop_region.strip())
-            # Validate crop region format
+            # crop_regionの形式を検証
             if not isinstance(crop_data, dict):
-                raise ValueError("crop_region must be a JSON object")
+                raise ValueError("crop_regionはJSONオブジェクトでなければなりません")
 
             required_keys = {'x1', 'y1', 'x2', 'y2'}
             if not all(key in crop_data for key in required_keys):
                 raise ValueError(
-                    "crop_region must contain x1, y1, x2, y2 coordinates")
+                    "crop_regionにはx1, y1, x2, y2座標が必要です")
 
-            # Convert to integers and validate
+            # 整数に変換して検証
             parsed_crop_region = {
                 'x1': int(crop_data['x1']),
                 'y1': int(crop_data['y1']),
@@ -877,22 +927,22 @@ async def analyze(
             if 'page' in crop_data and crop_data['page'] is not None:
                 parsed_crop_region['page'] = int(crop_data['page'])
 
-            # Basic sanity check
+            # 基本的な妙当性チェック
             if (parsed_crop_region['x1'] >= parsed_crop_region['x2'] or
                     parsed_crop_region['y1'] >= parsed_crop_region['y2']):
                 raise ValueError(
-                    "Invalid crop region: x1 must be < x2 and y1 must be < y2")
+                    "無効なクロップ範囲: x1はx2より小さく、y1はy2より小さい必要があります")
 
         except json.JSONDecodeError as e:
             set_progress(request_id, "error",
-                         f"Invalid JSON in crop_region: {e}", 0, 0)
+                         f"crop_regionの無効なJSON: {e}", 0, 0)
             raise HTTPException(
-                status_code=400, detail=f"Invalid JSON in crop_region: {e}")
+                status_code=400, detail=f"crop_regionの無効なJSON: {e}")
         except (ValueError, KeyError) as e:
             set_progress(request_id, "error",
-                         f"Invalid crop_region format: {e}", 0, 0)
+                         f"無効なcrop_region形式: {e}", 0, 0)
             raise HTTPException(
-                status_code=400, detail=f"Invalid crop_region format: {e}")
+                status_code=400, detail=f"無効なcrop_region形式: {e}")
 
     try:
         prompt = build_prompt(normalized_task, schema)
@@ -911,12 +961,13 @@ async def analyze(
     try:
         content = await file.read()
         input_path = save_temp_upload(file.filename or "upload.bin", content)
-        pages = load_pages(input_path, normalized_dpi, parsed_crop_region)
+        page_tuples = load_pages(
+            input_path, normalized_dpi, parsed_crop_region)
     except HTTPException:
         clear_cancel_request(request_id)
         raise
     except Exception as exc:
-        logger.exception("Failed to load input file")
+        logger.exception("入力ファイルの読み込みに失敗しました")
         clear_cancel_request(request_id)
         set_progress(request_id, "error", f"事前処理エラー: {exc}", 0, 0)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -924,7 +975,9 @@ async def analyze(
         if "input_path" in locals():
             Path(input_path).unlink(missing_ok=True)
 
-    total_pages = len(pages)
+    total_pages = len(page_tuples)
+    pages = [img for _, img in page_tuples]
+    page_numbers = [num for num, _ in page_tuples]
     set_progress(
         request_id,
         "ocr",
@@ -935,6 +988,7 @@ async def analyze(
         0,
     )
 
+    # APIレスポンス本体を組み立てる。
     def build_response(state: str, response_results: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "request_id": request_id,
@@ -952,6 +1006,7 @@ async def analyze(
             "results": response_results,
         }
 
+    # 中断時の進捗反映とレスポンス構築を行う。
     def build_canceled_response(
         response_results: list[dict[str, Any]],
         completed_pages: int,
@@ -972,7 +1027,7 @@ async def analyze(
 
     results: list[dict[str, Any]] = []
     try:
-        for index, page in enumerate(pages, start=1):
+        for index, (source_page, page) in enumerate(zip(page_numbers, pages), start=1):
             if is_cancel_requested(request_id):
                 return build_canceled_response(results, index - 1)
 
@@ -1006,7 +1061,7 @@ async def analyze(
                     return build_canceled_response(results, index - 1)
 
                 item: dict[str, Any] = {
-                    "page": index,
+                    "page": source_page,
                     "text": (
                         normalize_text_output(
                             clean_text,
@@ -1079,6 +1134,7 @@ async def analyze(
 
             region_semaphore = asyncio.Semaphore(normalized_region_parallelism)
 
+            # 単一レイアウト領域を切り出してOCRし、領域結果を返す。
             async def infer_region(
                 region_index: int,
                 layout_block: LayoutBlock,
@@ -1177,7 +1233,7 @@ async def analyze(
                 str(item.get("raw") or "").strip() for item in page_blocks if item
             ).strip()
             page_item: dict[str, Any] = {
-                "page": index,
+                "page": source_page,
                 "text": combined_text,
                 "raw": combined_raw,
                 "json": None,
@@ -1207,7 +1263,7 @@ async def analyze(
         raise
     except Exception as exc:
         clear_cancel_request(request_id)
-        logger.exception("Inference failed")
+        logger.exception("推論に失敗しました")
         set_progress(request_id, "error", f"推論エラー: {exc}", 0, total_pages)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

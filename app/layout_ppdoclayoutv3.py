@@ -193,7 +193,8 @@ def _load_paddle_layout_engine() -> Any:
             except Exception as exc:  # pragma: no cover - optional dependency
                 last_error = exc
 
-    _LAYOUT_ENGINE_ERROR = last_error or RuntimeError("No compatible PaddleOCR layout class")
+    _LAYOUT_ENGINE_ERROR = last_error or RuntimeError(
+        "No compatible PaddleOCR layout class")
     raise _LAYOUT_ENGINE_ERROR
 
 
@@ -267,7 +268,8 @@ def _detect_columns_fallback(image: Image.Image) -> list[LayoutBlock]:
         )
 
     if not blocks:
-        blocks = [LayoutBlock(type="text", bbox=(0, 0, width, height), score=0.1)]
+        blocks = [LayoutBlock(type="text", bbox=(
+            0, 0, width, height), score=0.1)]
     return blocks
 
 
@@ -287,7 +289,8 @@ def detect_layout_blocks(image: Image.Image, backend: str = "ppdoclayoutv3") -> 
         blocks = _extract_layout_blocks(raw, width, height)
         if blocks:
             return blocks
-        logger.warning("Layout engine returned no blocks. Using fallback columns.")
+        logger.warning(
+            "Layout engine returned no blocks. Using fallback columns.")
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.warning("Layout engine unavailable, using fallback: %s", exc)
 

@@ -30,13 +30,19 @@
 				--sans: "M PLUS 1p", "Hiragino Kaku Gothic ProN", sans-serif;
 			}
 
+			html {
+				height: 100%;
+				overflow: hidden;
+			}
+
 			* {
 				box-sizing: border-box;
 			}
 
 			body {
 				margin: 0;
-				min-height: 100vh;
+				height: 100vh;
+				overflow: hidden;
 				font-family: var(--sans);
 				color: var(--ink);
 				background: var(--bg-color);
@@ -61,9 +67,18 @@
 				gap: 8px;
 			}
 
+			.toolbar-logo {
+				height: 80px;
+				width: auto;
+				object-fit: contain;
+				display: block;
+				margin-right: 8px;
+				flex-shrink: 0;
+			}
+
 			.toolbar-title {
 				color: var(--toolbar-text);
-				font-size: 14px;
+				font-size: 24px;
 				font-weight: 600;
 				margin: 0 16px 0 0;
 			}
@@ -80,6 +95,67 @@
 			.toolbar-group:last-child {
 				border-right: none;
 				margin-right: 0;
+			}
+
+			/* Left thumbnail panel */
+			.thumb-panel {
+				width: 240px;
+				min-width: 240px;
+				max-width: 240px;
+				flex-shrink: 0;
+				background: #2c2c2c;
+				border-right: 1px solid #444;
+				display: flex;
+				flex-direction: column;
+				overflow-y: auto;
+				overflow-x: hidden;
+				gap: 0;
+				padding: 12px 8px;
+			}
+
+			.thumb-panel.hidden {
+				display: none;
+			}
+
+			.page-thumb {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: flex-start;
+				gap: 3px;
+				width: 100%;
+				padding: 4px 2px;
+				border: 1px solid transparent;
+				border-radius: 4px;
+				background: transparent;
+				color: #ccc;
+				cursor: pointer;
+				margin-bottom: 4px;
+			}
+
+			.page-thumb:hover {
+				background: rgba(255, 255, 255, 0.08);
+				border-color: rgba(255, 255, 255, 0.2);
+			}
+
+			.page-thumb.active {
+				border-color: #2ecc71;
+				background: rgba(46, 204, 113, 0.1);
+				color: #fff;
+			}
+
+			.page-thumb-canvas {
+				width: 120px;
+				height: 164px;
+				border-radius: 2px;
+				background: #ffffff;
+				image-rendering: auto;
+				display: block;
+			}
+
+			.page-thumb-num {
+				font-size: 12px;
+				line-height: 1;
 			}
 
 			.toolbar-btn {
@@ -128,6 +204,7 @@
 
 			/* Main Layout */
 			.main-container {
+				position: relative;
 				display: flex;
 				flex: 1;
 				overflow: hidden;
@@ -532,10 +609,17 @@
 				.toolbar-group.essential {
 					display: flex;
 				}
+
+				.thumb-panel {
+					width: 128px;
+					min-width: 128px;
+				}
 			}
 
 			/* PDF Preview Styles */
 			.pdf-preview-container {
+				position: absolute;
+				inset: 0;
 				width: 100%;
 				height: 100%;
 				min-width: 0;
@@ -630,22 +714,87 @@
 				color: var(--muted);
 				margin-top: 8px;
 			}
+
+			/* Processing overlay */
+			.ocr-overlay {
+				position: absolute;
+				inset: 0;
+				background: rgba(0, 0, 0, 0.45);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				z-index: 100;
+				border-radius: 4px;
+			}
+
+			.ocr-overlay-box {
+				background: rgba(255, 255, 255, 0.96);
+				border-radius: 10px;
+				padding: 28px 36px;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				gap: 14px;
+				box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
+				min-width: 220px;
+			}
+
+			.ocr-spinner {
+				width: 36px;
+				height: 36px;
+				border: 4px solid #d0d0d0;
+				border-top-color: var(--accent);
+				border-radius: 50%;
+				animation: ocr-spin 0.8s linear infinite;
+				flex-shrink: 0;
+			}
+
+			@keyframes ocr-spin {
+				to { transform: rotate(360deg); }
+			}
+
+			.ocr-overlay-msg {
+				font-size: 13px;
+				font-weight: 500;
+				color: #333;
+				text-align: center;
+				max-width: 260px;
+				word-break: break-word;
+			}
+
+			.ocr-overlay-cancel {
+				border: 1px solid #d0d0d0;
+				border-radius: 6px;
+				padding: 7px 14px;
+				font-size: 12px;
+				font-family: inherit;
+				cursor: pointer;
+				background: #ffffff;
+				color: #444;
+			}
+
+			.ocr-overlay-cancel:hover {
+				background: #f3f4f6;
+			}
+
+			.ocr-overlay-cancel:disabled {
+				opacity: 0.6;
+				cursor: not-allowed;
+			}
 		</style>
 	</head>
 	<body>
 		<!-- Toolbar -->
 		<div class="toolbar">
 			<div class="toolbar-left">
+				<img src="/static/pdpc-logo.png" alt="PDPC" class="toolbar-logo" />
 				<span class="toolbar-title">PS SOCR</span>
 				
 				<div class="toolbar-group">
 					<button class="toolbar-btn" id="openFileBtn">ファイルを開く</button>
 				</div>
-				
-				<div class="toolbar-group">
-					<button class="toolbar-btn" id="prevPageBtn">←</button>
-					<button class="toolbar-btn" id="nextPageBtn">→</button>
-				</div>
+
+	
 				
 				<div class="toolbar-group zoom-control">
 					<button class="toolbar-btn" id="zoomOut">-</button>
@@ -654,7 +803,7 @@
 				</div>
 				
 				<div class="toolbar-group">
-					<button class="toolbar-btn" id="fitBtn">1:1</button>
+					<button class="toolbar-btn" id="fitBtn">⇔</button>
 				</div>
 				
 				<div class="toolbar-group">
@@ -671,32 +820,29 @@
 
 		<!-- Main Container -->
 		<div class="main-container">
+			<!-- Page Thumbnail Panel -->
+			<div class="thumb-panel hidden" id="pageThumbWrap">
+				<div id="pageThumbStrip"></div>
+			</div>
+
 			<!-- Content Area -->
 			<div class="content-area">
 				<!-- Viewer Panel -->
 				<div class="viewer-panel" id="viewerPanel">
 					<div class="viewer-content">
-						読み込み済みファイルをここでプレビューします
+						ファイルを選択してください
 					</div>
 				</div>
-				
-				<!-- File Drop Area -->
-				<div class="file-drop-area">
-					<div class="file-drop-zone" id="fileDropzone">
-						<div class="file-drop-text" id="fileDropText">
-							ファイルを開いてください
-						</div>
-						<input
-							id="file"
-							name="file"
-							type="file"
-							class="file-input-overlay"
-							accept=".pdf,image/*"
-							title="OCR対象ファイル"
-							required
-						/>
-					</div>
-				</div>
+
+				<input
+					id="file"
+					name="file"
+					type="file"
+					class="hidden"
+					accept=".pdf,image/*"
+					title="OCR対象ファイル"
+					required
+				/>
 			</div>
 
 			<!-- Sidebar -->
@@ -1058,8 +1204,8 @@
 			const clearBtn = document.getElementById("clearBtn");
 			const clearResultBtn = document.getElementById("clearResultBtn");
 			const clearSelectionBtn = document.getElementById("clearSelectionBtn");
-			const prevPageBtn = document.getElementById("prevPageBtn");
-			const nextPageBtn = document.getElementById("nextPageBtn");
+			const pageThumbWrap = document.getElementById("pageThumbWrap");
+			const pageThumbStrip = document.getElementById("pageThumbStrip");
 			const zoomOutBtn = document.getElementById("zoomOut");
 			const zoomInBtn = document.getElementById("zoomIn");
 			const fitBtn = document.getElementById("fitBtn");
@@ -1106,6 +1252,10 @@
 			let currentViewItem = null;
 			let currentViewLabel = "";
 			let copyFeedbackTimer = null;
+			let thumbRenderToken = 0;
+			const PDF_THUMB_DISPLAY_WIDTH = 120;
+			const PDF_PREVIEW_QUALITY_SCALE = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+			const PDF_THUMB_QUALITY_SCALE = Math.min(3, Math.max(2, window.devicePixelRatio || 1));
 			let currentMeta = {
 				useLayout: false,
 				readingOrder: "auto",
@@ -1160,23 +1310,25 @@
 			}
 
 			function updateFileDropText() {
-				if (!fileDropText) return;
-				
 				// Clear any processing overlay when new file is selected
 				clearProcessingOverlay();
 				
 				if (fileInput && fileInput.files && fileInput.files.length > 0) {
 					const fileName = fileInput.files[0].name;
 					const file = fileInput.files[0];
-					fileDropText.textContent = `選択中: ${fileName}`;
+					if (fileDropText) {
+						fileDropText.textContent = `選択中: ${fileName}`;
+					}
 					
 					// Update viewer panel with actual file preview
 					updateViewerPreview(file);
 					return;
 				}
 				
-				fileDropText.textContent = "ファイルを開いてください";
-				viewerPanel.innerHTML = '<div class="viewer-content">読み込み済みファイルをここでプレビューします</div>';
+				if (fileDropText) {
+					fileDropText.textContent = "ファイルを開いてください";
+				}
+				viewerPanel.innerHTML = '<div class="viewer-content">ファイルを選択してください</div>';
 				
 				// Clean up PDF state when no file is selected
 				cleanupPDFState();
@@ -1234,7 +1386,7 @@
 			}
 
 			function setupFileDropzone() {
-				if (!fileDropzone || !fileInput) return;
+				if (!fileInput) return;
 
 				const onDragEnter = (event) => {
 					event.preventDefault();
@@ -1271,10 +1423,12 @@
 					updateFileDropText();
 				};
 
-				fileDropzone.addEventListener("dragenter", onDragEnter);
-				fileDropzone.addEventListener("dragleave", onDragLeave);
-				fileDropzone.addEventListener("dragover", onDragOver);
-				fileDropzone.addEventListener("drop", onDrop);
+				if (fileDropzone) {
+					fileDropzone.addEventListener("dragenter", onDragEnter);
+					fileDropzone.addEventListener("dragleave", onDragLeave);
+					fileDropzone.addEventListener("dragover", onDragOver);
+					fileDropzone.addEventListener("drop", onDrop);
+				}
 				fileInput.addEventListener("change", updateFileDropText);
 				updateFileDropText();
 			}
@@ -1384,71 +1538,32 @@
 
 			function renderLoading(message = "解析中... しばらくお待ちください。") {
 				resetCopyState();
-				// 処理中でもファイルプレビューは維持（処理中オーバーレイを追加）
-				if (fileInput && fileInput.files && fileInput.files.length > 0) {
-					const currentViewerContent = viewerPanel.innerHTML;
-					// プレビューがある場合は処理中オーバーレイを追加
-					if (currentViewerContent.includes('previewImage')) {
-						const overlay = document.createElement('div');
-						overlay.id = 'processingOverlay';
-						overlay.style.cssText = `
-							position: absolute;
-							top: 0;
-							left: 0;
-							width: 100%;
-							height: 100%;
-							background: rgba(255, 255, 255, 0.8);
-							display: flex;
-							align-items: center;
-							justify-content: center;
-							font-size: 14px;
-							color: #666;
-							z-index: 1000;
-						`;
-						overlay.textContent = message;
-						
-						// viewerPanelの最初の子要素（viewer-content）に relative position を設定
-						const viewerContent = viewerPanel.querySelector('.viewer-content');
-						if (viewerContent) {
-							viewerContent.style.position = 'relative';
-							// 既存のオーバーレイを削除
-							const existingOverlay = viewerContent.querySelector('#processingOverlay');
-							if (existingOverlay) {
-								existingOverlay.remove();
-							}
-							viewerContent.appendChild(overlay);
-						}
-					} else {
-						// プレビューがない場合はシンプルなローディング表示
-						viewerPanel.innerHTML = `<div class="viewer-content" style="padding: 16px; text-align: center; color: #666;">${message}</div>`;
-					}
-				} else {
-					viewerPanel.innerHTML = '<div class="viewer-content">処理中...</div>';
-				}
-				
-				// Update hidden elements for compatibility
-				if (resultBody) {
-					resultBody.innerHTML = "";
-					const card = document.createElement("div");
-					card.className = "card";
-					const pre = document.createElement("pre");
-					pre.id = "loadingText";
-					pre.textContent = message;
-					card.appendChild(pre);
-					resultBody.appendChild(card);
+				clearProcessingOverlay();
+
+				const overlay = document.createElement('div');
+				overlay.id = 'processingOverlay';
+				overlay.className = 'ocr-overlay';
+				overlay.innerHTML = `
+					<div class="ocr-overlay-box">
+						<div class="ocr-spinner"></div>
+						<div class="ocr-overlay-msg" id="processingMessage">${message}</div>
+						<button type="button" class="ocr-overlay-cancel" id="overlayCancelBtn">中止</button>
+					</div>
+				`;
+				viewerPanel.appendChild(overlay);
+
+				const overlayCancelBtn = document.getElementById("overlayCancelBtn");
+				if (overlayCancelBtn) {
+					overlayCancelBtn.addEventListener("click", () => {
+						void requestCancelCurrentOCR();
+					});
 				}
 			}
 
 			function updateLoading(message) {
-				const pre = document.getElementById("loadingText");
-				if (pre) {
-					pre.textContent = message;
-				}
-				
-				// Update processing overlay if it exists
-				const overlay = document.getElementById("processingOverlay");
-				if (overlay) {
-					overlay.textContent = message;
+				const msg = document.getElementById("processingMessage");
+				if (msg) {
+					msg.textContent = message;
 				}
 			}
 
@@ -1459,6 +1574,43 @@
 				}
 				
 				// プレビューの復元はOCR完了後に明示的に行う（無限ループ防止）
+			}
+
+			async function requestCancelCurrentOCR() {
+				if (!activeRequestId) return;
+
+				const requestId = activeRequestId;
+				if (cancelBtn) {
+					cancelBtn.disabled = true;
+				}
+				const overlayCancelBtn = document.getElementById("overlayCancelBtn");
+				if (overlayCancelBtn instanceof HTMLButtonElement) {
+					overlayCancelBtn.disabled = true;
+				}
+				statusIndicator.textContent = "中断要求中...";
+				updateLoading("中断要求中...");
+
+				try {
+					const res = await fetch(`/api/cancel/${encodeURIComponent(requestId)}`, {
+						method: "POST",
+					});
+					const payload = await res.json();
+					if (!res.ok) {
+						throw new Error(payload.detail || "中断要求に失敗しました");
+					}
+					statusIndicator.textContent = payload.message || "中断要求を受け付けました";
+					updateLoading(payload.message || "中断要求を受け付けました");
+				} catch (error) {
+					statusIndicator.textContent = `中断要求失敗: ${error.message}`;
+					if (activeRequestId) {
+						if (cancelBtn) {
+							cancelBtn.disabled = false;
+						}
+						if (overlayCancelBtn instanceof HTMLButtonElement) {
+							overlayCancelBtn.disabled = false;
+						}
+					}
+				}
 			}
 
 			function renderResultHistory() {
@@ -1803,7 +1955,7 @@
 				if (fileInput && fileInput.files && fileInput.files.length > 0) {
 					updateViewerPreview(fileInput.files[0]);
 				} else {
-					viewerPanel.innerHTML = '<div class="viewer-content">読み込み済みファイルをここでプレビューします</div>';
+					viewerPanel.innerHTML = '<div class="viewer-content">ファイルを選択してください</div>';
 					// Clear PDF state and cleanup
 					cleanupPDFState();
 				}
@@ -1844,19 +1996,74 @@
 				pdfState.selectionRect = null;
 				pdfState.isSelecting = false;
 				pdfState.renderingPage = false;
+				thumbRenderToken += 1;
+				clearPageThumbnails();
 				updatePDFControls();
 			}
 
-			function showPreviousPdfPage() {
-				if (!pdfState.pdfDoc || pdfState.renderingPage || pdfState.currentPage <= 1) return;
-				pdfState.currentPage -= 1;
-				renderPDFPage(pdfState.currentPage);
+			function clearPageThumbnails() {
+				if (pageThumbStrip) {
+					pageThumbStrip.innerHTML = "";
+				}
+				if (pageThumbWrap) {
+					pageThumbWrap.classList.add("hidden");
+				}
 			}
 
-			function showNextPdfPage() {
-				if (!pdfState.pdfDoc || pdfState.renderingPage || pdfState.currentPage >= pdfState.totalPages) return;
-				pdfState.currentPage += 1;
-				renderPDFPage(pdfState.currentPage);
+			async function renderPageThumbnail(pageNum, token) {
+				if (!pdfState.pdfDoc || !pageThumbStrip || token !== thumbRenderToken) return;
+				const button = pageThumbStrip.querySelector(`[data-page="${pageNum}"]`);
+				if (!button) return;
+				const canvas = button.querySelector("canvas");
+				if (!canvas) return;
+				if (canvas.dataset.rendered === "true") return;
+
+				try {
+					const pdfPage = await pdfState.pdfDoc.getPage(pageNum);
+					if (token !== thumbRenderToken) return;
+					const viewport = pdfPage.getViewport({ scale: 1.0 });
+					const displayScale = PDF_THUMB_DISPLAY_WIDTH / viewport.width;
+					const renderScale = displayScale * PDF_THUMB_QUALITY_SCALE;
+					const thumbViewport = pdfPage.getViewport({ scale: renderScale });
+					canvas.width = Math.max(1, Math.floor(thumbViewport.width));
+					canvas.height = Math.max(1, Math.floor(thumbViewport.height));
+					const ctx = canvas.getContext("2d");
+					if (!ctx) return;
+					ctx.imageSmoothingEnabled = true;
+					ctx.imageSmoothingQuality = "high";
+					await pdfPage.render({ canvasContext: ctx, viewport: thumbViewport }).promise;
+					canvas.dataset.rendered = "true";
+				} catch (error) {
+					button.title = "サムネイル生成に失敗";
+				}
+			}
+
+			async function buildPageThumbnails() {
+				if (!pdfState.pdfDoc || !pageThumbStrip || !pageThumbWrap) return;
+				thumbRenderToken += 1;
+				const token = thumbRenderToken;
+				pageThumbStrip.innerHTML = "";
+				pageThumbWrap.classList.remove("hidden");
+
+				for (let pageNum = 1; pageNum <= pdfState.totalPages; pageNum += 1) {
+					const btn = document.createElement("button");
+					btn.type = "button";
+					btn.className = "page-thumb";
+					btn.dataset.page = String(pageNum);
+					btn.title = `ページ ${pageNum}`;
+					btn.innerHTML = `<canvas class="page-thumb-canvas" data-rendered="false"></canvas><span class="page-thumb-num">${pageNum}</span>`;
+					btn.addEventListener("click", () => {
+						if (!pdfState.pdfDoc || pdfState.renderingPage || pdfState.currentPage === pageNum) return;
+						pdfState.currentPage = pageNum;
+						renderPDFPage(pageNum);
+					});
+					pageThumbStrip.appendChild(btn);
+				}
+
+				for (let pageNum = 1; pageNum <= pdfState.totalPages; pageNum += 1) {
+					if (token !== thumbRenderToken) return;
+					await renderPageThumbnail(pageNum, token);
+				}
 			}
 
 			function zoomPdfOut() {
@@ -2138,7 +2345,7 @@
 				if (resultLayout) resultLayout.textContent = `layout: ${useLayoutInput.value}`;
 				if (resultOrder) resultOrder.textContent = `order: ${readingOrderInput.value}`;
 				
-				renderLoading("事前処理中");
+				renderLoading("OCR実行中...");
 				startProgressPolling(requestId);
 
 				try {
@@ -2197,7 +2404,9 @@
 			});
 
 			openFileBtn.addEventListener("click", () => {
-				fileInput.click();
+				if (fileInput) {
+					fileInput.click();
+				}
 			});
 
 			settingsBtn.addEventListener("click", showSettings);
@@ -2222,14 +2431,6 @@
 				}
 				renderPage(index);
 			});
-
-			if (prevPageBtn) {
-				prevPageBtn.addEventListener("click", showPreviousPdfPage);
-			}
-
-			if (nextPageBtn) {
-				nextPageBtn.addEventListener("click", showNextPdfPage);
-			}
 
 			if (zoomOutBtn) {
 				zoomOutBtn.addEventListener("click", zoomPdfOut);
@@ -2259,30 +2460,8 @@
 
 			// Cancel button compatibility (hidden)
 			if (cancelBtn) {
-				cancelBtn.addEventListener("click", async () => {
-					if (!activeRequestId) return;
-					
-					const requestId = activeRequestId;
-					cancelBtn.disabled = true;
-					statusIndicator.textContent = "中断要求中...";
-					updateLoading("中断要求中...");
-					
-					try {
-						const res = await fetch(`/api/cancel/${encodeURIComponent(requestId)}`, {
-							method: "POST",
-						});
-						const payload = await res.json();
-						if (!res.ok) {
-							throw new Error(payload.detail || "中断要求に失敗しました");
-						}
-						statusIndicator.textContent = payload.message || "中断要求を受け付けました";
-						updateLoading(payload.message || "中断要求を受け付けました");
-					} catch (error) {
-						statusIndicator.textContent = `中断要求失敗: ${error.message}`;
-						if (activeRequestId) {
-							cancelBtn.disabled = false;
-						}
-					}
+				cancelBtn.addEventListener("click", () => {
+					void requestCancelCurrentOCR();
 				});
 			}
 
@@ -2360,6 +2539,7 @@
 
 					// UIを構築
 					setupPDFPreviewUI(fileName, fileSize);
+					void buildPageThumbnails();
 
 					// 最初のページを表示
 					setTimeout(() => {
@@ -2448,16 +2628,21 @@
 
 					const page = await pdfState.pdfDoc.getPage(pageNum);
 					const baseViewport = page.getViewport({ scale: 1.0 });
-					const viewport = page.getViewport({ scale: pdfState.scale });
+					const displayViewport = page.getViewport({ scale: pdfState.scale });
+					const renderViewport = page.getViewport({ scale: pdfState.scale * PDF_PREVIEW_QUALITY_SCALE });
 					const renderCanvas = document.createElement('canvas');
 					const renderContext2d = renderCanvas.getContext('2d');
-					renderCanvas.width = viewport.width;
-					renderCanvas.height = viewport.height;
+					renderCanvas.width = Math.max(1, Math.floor(renderViewport.width));
+					renderCanvas.height = Math.max(1, Math.floor(renderViewport.height));
 					
 					const renderContext = {
 						canvasContext: renderContext2d,
-						viewport: viewport
+						viewport: renderViewport
 					};
+					if (renderContext2d) {
+						renderContext2d.imageSmoothingEnabled = true;
+						renderContext2d.imageSmoothingQuality = 'high';
+					}
 					
 					const renderPromise = page.render(renderContext).promise;
 					const timeoutPromise = new Promise((_, reject) => {
@@ -2468,8 +2653,9 @@
 
 					pdfState.pageWidth = baseViewport.width;
 					pdfState.pageHeight = baseViewport.height;
-					previewImage.style.width = `${viewport.width}px`;
-					previewImage.style.height = `${viewport.height}px`;
+					previewImage.style.width = `${displayViewport.width}px`;
+					previewImage.style.height = `${displayViewport.height}px`;
+					previewImage.style.imageRendering = 'auto';
 					previewImage.src = renderCanvas.toDataURL('image/png');
 					setupImageSelection();
 					
@@ -2500,11 +2686,21 @@
 				if (zoomLevel) {
 					zoomLevel.textContent = pdfState.pdfDoc ? `${Math.round(pdfState.scale * 100)}%` : '100%';
 				}
-				if (prevPageBtn) prevPageBtn.disabled = !pdfState.pdfDoc || pdfState.currentPage <= 1 || pdfState.renderingPage;
-				if (nextPageBtn) nextPageBtn.disabled = !pdfState.pdfDoc || pdfState.currentPage >= pdfState.totalPages || pdfState.renderingPage;
 				if (zoomOutBtn) zoomOutBtn.disabled = !pdfState.pdfDoc || pdfState.scale <= 0.5 || pdfState.renderingPage;
 				if (zoomInBtn) zoomInBtn.disabled = !pdfState.pdfDoc || pdfState.scale >= 3.0 || pdfState.renderingPage;
 				if (fitBtn) fitBtn.disabled = !pdfState.pdfDoc || pdfState.renderingPage;
+
+				if (pageThumbStrip) {
+					const thumbButtons = pageThumbStrip.querySelectorAll(".page-thumb");
+					thumbButtons.forEach((button) => {
+						const pageNum = Number(button.dataset.page);
+						button.classList.toggle("active", pageNum === pdfState.currentPage);
+						button.disabled = pdfState.renderingPage;
+						if (pageNum === pdfState.currentPage) {
+							button.scrollIntoView({ block: "nearest", inline: "nearest" });
+						}
+					});
+				}
 			}
 
 			function fitPDFToContainer() {
