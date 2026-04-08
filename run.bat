@@ -62,7 +62,7 @@ if /I "%TORCH_CHANNEL%"=="cpu" (
 python -c "import torch; print('[torch]', torch.__version__, 'cuda=', torch.version.cuda, 'available=', torch.cuda.is_available())"
 
 echo [+] Installing FastAPI and image/PDF dependencies...
-python -m pip install fastapi uvicorn python-multipart pillow pypdfium2 accelerate
+python -m pip install fastapi uvicorn python-multipart pillow pypdfium2 accelerate python-dotenv auth0-server-python
 
 echo [+] Installing optional layout dependencies (PaddleOCR)...
 python -m pip install --upgrade paddlepaddle
