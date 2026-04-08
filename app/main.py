@@ -200,7 +200,7 @@ def load_pages(path: Path, dpi: int, crop_region: Optional[dict] = None) -> list
     # 単一ページ画像に対してcrop_regionを適用する。
 
     def apply_crop_if_needed(image: Image.Image) -> Image.Image:
-        if crop_region is None:
+        if crop_region is None or 'x1' not in crop_region:
             return image
         img_width, img_height = image.size
         x1 = max(0, min(crop_region['x1'], img_width - 1))
@@ -965,26 +965,31 @@ async def analyze(
             if not isinstance(crop_data, dict):
                 raise ValueError("crop_regionはJSONオブジェクトでなければなりません")
 
-            required_keys = {'x1', 'y1', 'x2', 'y2'}
-            if not all(key in crop_data for key in required_keys):
-                raise ValueError(
-                    "crop_regionにはx1, y1, x2, y2座標が必要です")
+            coord_keys = {'x1', 'y1', 'x2', 'y2'}
+            has_coords = all(key in crop_data for key in coord_keys)
+            has_page = 'page' in crop_data and crop_data['page'] is not None
 
-            # 整数に変換して検証
-            parsed_crop_region = {
-                'x1': int(crop_data['x1']),
-                'y1': int(crop_data['y1']),
-                'x2': int(crop_data['x2']),
-                'y2': int(crop_data['y2'])
-            }
-            if 'page' in crop_data and crop_data['page'] is not None:
+            if not has_coords and not has_page:
+                raise ValueError(
+                    "crop_regionにはx1, y1, x2, y2座標またはpageが必要です")
+
+            parsed_crop_region = {}
+            if has_page:
                 parsed_crop_region['page'] = int(crop_data['page'])
 
-            # 基本的な妙当性チェック
-            if (parsed_crop_region['x1'] >= parsed_crop_region['x2'] or
-                    parsed_crop_region['y1'] >= parsed_crop_region['y2']):
-                raise ValueError(
-                    "無効なクロップ範囲: x1はx2より小さく、y1はy2より小さい必要があります")
+            if has_coords:
+                # 整数に変換して検証
+                parsed_crop_region.update({
+                    'x1': int(crop_data['x1']),
+                    'y1': int(crop_data['y1']),
+                    'x2': int(crop_data['x2']),
+                    'y2': int(crop_data['y2'])
+                })
+                # 基本的な妥当性チェック
+                if (parsed_crop_region['x1'] >= parsed_crop_region['x2'] or
+                        parsed_crop_region['y1'] >= parsed_crop_region['y2']):
+                    raise ValueError(
+                        "無効なクロップ範囲: x1はx2より小さく、y1はy2より小さい必要があります")
 
         except json.JSONDecodeError as e:
             set_progress(request_id, "error",

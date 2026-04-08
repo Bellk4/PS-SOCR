@@ -2012,14 +2012,34 @@
 			function clearResults() {
 				resultHistory = [];
 				renderResultHistory();
-				// ファイルが選択されている場合は、プレビューを復元
-				if (fileInput && fileInput.files && fileInput.files.length > 0) {
-					updateViewerPreview(fileInput.files[0]);
-				} else {
-					viewerPanel.innerHTML = '<div class="viewer-content">ファイルを選択してください</div>';
-					// Clear PDF state and cleanup
-					cleanupPDFState();
+
+				// ファイルをクリア
+				if (fileInput) {
+					fileInput.value = "";
 				}
+
+				// 設定を初期値にリセット
+				document.getElementById("task").value = "text";
+				document.getElementById("linebreak_mode").value = "none";
+				document.getElementById("device").value = "auto";
+				document.getElementById("dpi").value = "220";
+				document.getElementById("max_new_tokens").value = "1024";
+				document.getElementById("temperature").value = "0";
+				document.getElementById("use_layout").value = "false";
+				document.getElementById("layout_backend").value = "ppdoclayoutv3";
+				document.getElementById("reading_order").value = "auto";
+				document.getElementById("region_padding").value = "12";
+				document.getElementById("max_regions").value = "200";
+				document.getElementById("region_parallelism").value = "1";
+				if (schemaInput) schemaInput.value = "";
+				toggleSchema();
+				toggleLayoutOptions();
+
+				// プレビューをリセット
+				viewerPanel.innerHTML = '<div class="viewer-content">ファイルを選択してください</div>';
+				cleanupPDFState();
+				clearSelection();
+
 				pageSelect.innerHTML = "";
 				pagePickerWrap.classList.add("hidden");
 				resetCopyState();
@@ -2370,8 +2390,13 @@
 				}
 
 				// Add selection crop region if available
-				if (selectionState.selectionRect && selectionState.image) {
-					const isPdfFile = fileInput.files[0].type === 'application/pdf' || fileInput.files[0].name.toLowerCase().endsWith('.pdf');
+				const isPdfFile = fileInput.files[0].type === 'application/pdf' || fileInput.files[0].name.toLowerCase().endsWith('.pdf');
+				const hasSelection = !!(selectionState.selectionRect && selectionState.image);
+				if (!hasSelection) {
+					const confirmed = window.confirm("範囲選択がありません。ページ全体をOCRするため推論に時間がかかる場合があります。続行しますか？");
+					if (!confirmed) return;
+				}
+				if (hasSelection) {
 					if (isPdfFile && pdfState.pdfDoc) {
 						const actualCoords = getPDFActualCoords(selectionState.selectionRect);
 						formData.append("crop_region", JSON.stringify({
@@ -2390,6 +2415,11 @@
 							y2: Math.round(actualCoords.y2)
 						}));
 					}
+				} else if (isPdfFile && pdfState.pdfDoc) {
+					// 選択なし: 表示中のページのみOCR
+					formData.append("crop_region", JSON.stringify({
+						page: pdfState.currentPage
+					}));
 				}
 
 				setBusy(true, "事前処理中");
