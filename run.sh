@@ -75,7 +75,7 @@ print("[torch]", torch.__version__, "cuda=", torch.version.cuda, "available=", t
 PY
 
 echo "[+] Installing FastAPI and image/PDF dependencies..."
-python -m pip install fastapi uvicorn python-multipart pillow pypdfium2 accelerate
+python -m pip install fastapi uvicorn python-multipart pillow pypdfium2 accelerate python-dotenv auth0-server-python
 
 echo "[+] Installing optional layout dependencies (PaddleOCR)..."
 if ! python -m pip install --upgrade paddlepaddle; then
