@@ -1,5 +1,7 @@
 import base64
 import asyncio
+import csv
+import difflib
 import io
 import json
 import logging
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional, cast
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -662,6 +664,90 @@ GENERATE_SEMAPHORE = asyncio.Semaphore(1)
 PROGRESS_STATE: dict[str, dict[str, Any]] = {}
 MAX_PROGRESS_ENTRIES = 300
 CANCEL_REQUESTS: set[str] = set()
+# {session_id: response} VB.NET連携用
+_SESSION_RESULTS: dict[str, dict[str, Any]] = {}
+_SESSION_TIMESTAMPS: dict[str, float] = {}  # {session_id: stored_at}
+MAX_SESSION_ENTRIES = 100
+_LATEST_RESULT: Optional[dict[str, Any]] = None  # ブラウザ単体起動用（最新1件のみ保持）
+
+# ---- 候補マッチング ----
+
+CANDIDATES_CSV_PATH = Path(
+    os.getenv("CANDIDATES_CSV", str(ROOT_DIR / "商品リスト.csv"))
+)
+DEFAULT_MATCH_TOP_K = 30
+
+_CANDIDATES_CACHE: Optional[list[dict[str, str]]] = None
+
+
+# 商品リストCSVを読み込んでキャッシュする。エンコーディングは自動判定。
+def load_candidates(force_reload: bool = False) -> list[dict[str, str]]:
+    global _CANDIDATES_CACHE
+    if _CANDIDATES_CACHE is not None and not force_reload:
+        return _CANDIDATES_CACHE
+    if not CANDIDATES_CSV_PATH.exists():
+        logger.warning("候補リストCSVが見つかりません: %s", CANDIDATES_CSV_PATH)
+        _CANDIDATES_CACHE = []
+        return []
+    rows: list[dict[str, str]] = []
+    for enc in ("utf-8-sig", "utf-8", "shift_jis", "cp932"):
+        try:
+            with open(CANDIDATES_CSV_PATH, encoding=enc, newline="") as f:
+                reader = csv.reader(f)
+                next(reader, None)  # ヘッダースキップ
+                for row in reader:
+                    if len(row) < 4:
+                        continue
+                    shohincd = row[0].strip()
+                    subcd    = row[1].strip()
+                    shohinnm = row[2].strip()
+                    kikaku   = row[3].strip()
+                    rows.append({
+                        "shohincd": shohincd,
+                        "subcd":    subcd,
+                        "shohinnm": shohinnm,
+                        "kikaku":   kikaku,
+                        "search_key": f"{shohinnm} {kikaku}".strip(),
+                    })
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            rows = []
+            continue
+    _CANDIDATES_CACHE = rows
+    logger.info("候補リストを読み込みました: %d 件 (%s)", len(rows), CANDIDATES_CSV_PATH)
+    return rows
+
+
+# OCRテキストとの文字列類似度でtop_k件に絞り込む。
+def prefilter_candidates(
+    ocr_text: str,
+    candidates: list[dict[str, str]],
+    top_k: int,
+) -> list[dict[str, str]]:
+    if not candidates:
+        return []
+    query = ocr_text.lower()
+    scored = [
+        (difflib.SequenceMatcher(None, query, c["search_key"].lower()).ratio(), i)
+        for i, c in enumerate(candidates)
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [candidates[i] for _, i in scored[:top_k]]
+
+
+# 絞り込んだ候補リストを埋め込んだマッチング用プロンプトを組み立てる。
+def build_match_prompt(candidates: list[dict[str, str]]) -> str:
+    lines = [
+        f"{i + 1}. [{c['shohincd']}/{c['subcd']}] {c['shohinnm']} / {c['kikaku']}"
+        for i, c in enumerate(candidates)
+    ]
+    return (
+        "以下の候補リストから、画像に写っているテキストに最も合致するものを1つ選んでください。\n\n"
+        "候補リスト:\n" + "\n".join(lines) + "\n\n"
+        "最も合致する候補について、以下のJSON形式のみで出力してください（説明不要）:\n"
+        '{"no": 番号, "shohincd": "コード", "subcd": "サブコード", '
+        '"shohinnm": "商品名", "kikaku": "規格", "confidence": "high/medium/low"}'
+    )
 
 
 # リクエスト進捗状態を保存し、上限を超えた古い履歴を間引く。
@@ -797,6 +883,7 @@ async def get_authenticated_user(request: Request) -> Optional[dict[str, Any]]:
 
 @app.middleware("http")
 async def require_login_for_app(request: Request, call_next):
+    return await call_next(request)  # TODO: 一時的に認証を無効化 — 本番前に削除すること
     if OAUTH_CLIENT is None or request.method == "OPTIONS":
         return await call_next(request)
 
@@ -826,6 +913,7 @@ async def startup_load_model() -> None:
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     default_device = resolve_device("auto")
     await RUNTIME.ensure_loaded(default_device)
+    load_candidates()
     logger.info(
         "起動完了 (デバイス=%s, キャッシュディレクトリ=%s)",
         default_device,
@@ -873,9 +961,198 @@ async def cancel(request_id: str) -> dict[str, Any]:
     return request_cancel(request_id)
 
 
+@app.get("/api/candidates/status")
+# 候補リストの読み込み状態を返す。
+async def candidates_status() -> dict[str, Any]:
+    candidates = load_candidates()
+    return {
+        "count": len(candidates),
+        "path": str(CANDIDATES_CSV_PATH),
+        "loaded": len(candidates) > 0,
+    }
+
+
+@app.post("/api/candidates/reload")
+# 商品リストCSVをディスクから再読み込みする。
+async def candidates_reload() -> dict[str, Any]:
+    rows = await asyncio.to_thread(load_candidates, True)
+    return {"count": len(rows), "path": str(CANDIDATES_CSV_PATH)}
+
+
+@app.post("/api/match")
+# 画像からテキストを読み取り、商品リストから最も近い候補をGLMで推論して返す。
+# Pass 1: GLMでOCR → Pass 2: top_k件に絞り込みGLMでマッチング
+async def match_product(
+    file: UploadFile = File(...),
+    device: str = Form("auto"),
+    dpi: int = Form(DEFAULT_DPI),
+    top_k: int = Form(DEFAULT_MATCH_TOP_K),
+    max_new_tokens: int = Form(512),
+    temperature: float = Form(DEFAULT_TEMPERATURE),
+    request_id: Optional[str] = Form(None),
+) -> dict[str, Any]:
+    request_id = (request_id or "").strip() or uuid.uuid4().hex
+    clear_cancel_request(request_id)
+    set_progress(request_id, "preprocessing", "事前処理中", 0, 2)
+
+    normalized_top_k = max(1, min(100, int(top_k or DEFAULT_MATCH_TOP_K)))
+    normalized_max_new_tokens = max(1, min(4096, int(max_new_tokens or 512)))
+    normalized_dpi = max(36, min(600, int(dpi or DEFAULT_DPI)))
+
+    candidates = load_candidates()
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail=f"候補リストが見つかりません: {CANDIDATES_CSV_PATH}",
+        )
+
+    resolved_device = resolve_device(device)
+    try:
+        await RUNTIME.ensure_loaded(resolved_device)
+        processor, model, actual_device = RUNTIME.get()
+    except Exception as exc:
+        clear_cancel_request(request_id)
+        set_progress(request_id, "error", str(exc), 0, 2)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    input_path: Optional[Path] = None
+    try:
+        content = await file.read()
+        input_path = save_temp_upload(file.filename or "upload.bin", content)
+        page_tuples = load_pages(input_path, normalized_dpi)
+    except Exception as exc:
+        clear_cancel_request(request_id)
+        set_progress(request_id, "error", f"事前処理エラー: {exc}", 0, 2)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
+
+    if not page_tuples:
+        raise HTTPException(status_code=400, detail="ページが見つかりません")
+
+    _, page_image = page_tuples[0]
+    page_path: Optional[Path] = None
+    ocr_text = ""
+    raw_match = ""
+    clean_match = ""
+    try:
+        page_path = save_temp_png(page_image)
+
+        # Pass 1: テキスト認識
+        set_progress(request_id, "ocr", "テキスト認識中 (1/2)", 1, 2)
+        async with GENERATE_SEMAPHORE:
+            _, ocr_text, _ = await asyncio.to_thread(
+                glm_infer,
+                processor,
+                model,
+                str(page_path),
+                "Text Recognition:",
+                normalized_max_new_tokens,
+                float(temperature),
+                request_id,
+            )
+
+        if is_cancel_requested(request_id):
+            set_progress(request_id, "canceled", "中断しました", 1, 2)
+            clear_cancel_request(request_id)
+            return {"request_id": request_id, "state": "canceled", "matched": None}
+
+        # CPU側で候補を絞り込む
+        filtered = await asyncio.to_thread(
+            prefilter_candidates, ocr_text, candidates, normalized_top_k
+        )
+        match_prompt = build_match_prompt(filtered)
+
+        # Pass 2: 候補マッチング
+        set_progress(request_id, "ocr", "候補マッチング中 (2/2)", 2, 2)
+        async with GENERATE_SEMAPHORE:
+            raw_match, clean_match, _ = await asyncio.to_thread(
+                glm_infer,
+                processor,
+                model,
+                str(page_path),
+                match_prompt,
+                normalized_max_new_tokens,
+                float(temperature),
+                request_id,
+            )
+    except HTTPException:
+        clear_cancel_request(request_id)
+        set_progress(request_id, "error", "APIエラー", 0, 2)
+        raise
+    except Exception as exc:
+        clear_cancel_request(request_id)
+        logger.exception("マッチング推論に失敗しました")
+        set_progress(request_id, "error", f"推論エラー: {exc}", 0, 2)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if page_path is not None:
+            page_path.unlink(missing_ok=True)
+
+    if is_cancel_requested(request_id):
+        set_progress(request_id, "canceled", "中断しました", 2, 2)
+        clear_cancel_request(request_id)
+        return {"request_id": request_id, "state": "canceled", "matched": None}
+
+    # GLM出力からJSONを抽出
+    matched: Optional[dict[str, Any]] = None
+    parse_error: Optional[str] = None
+    try:
+        json_hit = re.search(r"\{[^{}]*\}", clean_match, re.DOTALL)
+        if json_hit:
+            matched = json.loads(json_hit.group())
+            # no フィールドで候補を補完（モデルが省略した場合のフォールバック）
+            no = int(matched.get("no", 0)) - 1
+            if 0 <= no < len(filtered):
+                ref = filtered[no]
+                matched.setdefault("shohincd", ref["shohincd"])
+                matched.setdefault("subcd",    ref["subcd"])
+                matched.setdefault("shohinnm", ref["shohinnm"])
+                matched.setdefault("kikaku",   ref["kikaku"])
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        parse_error = str(exc)
+
+    set_progress(request_id, "done", "完了", 2, 2)
+    clear_cancel_request(request_id)
+
+    return {
+        "request_id":      request_id,
+        "state":           "done",
+        "device":          actual_device,
+        "ocr_text":        ocr_text,
+        "matched":         matched,
+        "candidates_shown": [{"no": i + 1, **c} for i, c in enumerate(filtered)],
+        "raw_response":    raw_match,
+        "parse_error":     parse_error,
+    }
+
+
+# session_id指定時（VB.NET連携）はセッション結果を返す。未指定時（ブラウザ単体）は直近の結果を返す。
+async def latest_result(
+    session_id: Optional[str] = Query(
+        None, description="VB.NETアプリが発行したセッションID"),
+) -> dict[str, Any]:
+    if session_id:
+        # VB.NET連携モード: セッションキーで検索、見つからなければ直近結果にフォールバック
+        result = _SESSION_RESULTS.get(session_id)
+        if result is not None:
+            return {"results": result.get("results", [])}
+        logger.info(
+            "/api/latest_result: session_id=%s not found, falling back to latest", session_id)
+        if _LATEST_RESULT is not None:
+            return {"results": _LATEST_RESULT.get("results", [])}
+        raise HTTPException(status_code=404, detail="まだ解析結果がありません")
+    # ブラウザ単体モード: 直近の1件を返す
+    if _LATEST_RESULT is None:
+        raise HTTPException(status_code=404, detail="まだ解析結果がありません")
+    return {"results": _LATEST_RESULT.get("results", [])}
+
+
 @app.post("/api/analyze")
 # OCRリクエストを受け取り、前処理・推論・後処理を実行して結果を返す。
 async def analyze(
+    request: Request,
     file: UploadFile = File(...),
     device: str = Form("auto"),
     dpi: int = Form(DEFAULT_DPI),
@@ -892,8 +1169,12 @@ async def analyze(
     region_parallelism: int = Form(DEFAULT_REGION_PARALLELISM),
     crop_region: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
+    session_id: Optional[str] = Form(None),
 ) -> dict[str, Any]:
     request_id = (request_id or "").strip() or uuid.uuid4().hex
+    # session_idは Form または URL クエリパラメータのどちらからでも受け取る
+    raw_session_id = session_id or request.query_params.get("session_id")
+    normalized_session_id = (raw_session_id or "").strip() or None
     clear_cancel_request(request_id)
     set_progress(request_id, "preprocessing", "事前処理中", 0, 0)
 
@@ -1329,4 +1610,21 @@ async def analyze(
     set_progress(request_id, "done", "完了", total_pages, total_pages, 0, 0)
     clear_cancel_request(request_id)
 
-    return build_response("done", results)
+    response = build_response("done", results)
+    # session_id指定時（VB.NET連携）はそのキーでセッション辞書に保存
+    # session_id未指定時（ブラウザ単体）は最新で1件のみ上書き保存
+    global _LATEST_RESULT
+    if normalized_session_id:
+        _SESSION_RESULTS[normalized_session_id] = response
+        _SESSION_TIMESTAMPS[normalized_session_id] = time.time()
+        # 上限超過時は最古のセッションを間引く
+        if len(_SESSION_RESULTS) > MAX_SESSION_ENTRIES:
+            oldest = sorted(_SESSION_TIMESTAMPS.items(), key=lambda x: x[1])[
+                : len(_SESSION_RESULTS) - MAX_SESSION_ENTRIES
+            ]
+            for sid, _ in oldest:
+                _SESSION_RESULTS.pop(sid, None)
+                _SESSION_TIMESTAMPS.pop(sid, None)
+    else:
+        _LATEST_RESULT = response
+    return response

@@ -789,6 +789,100 @@
 				opacity: 0.6;
 				cursor: not-allowed;
 			}
+
+			/* 入力連携パネル */
+			.input-link-panel {
+				position: fixed;
+				top: 50px;
+				right: -420px;
+				width: 380px;
+				height: calc(100vh - 50px);
+				background: var(--panel);
+				border-left: 1px solid var(--panel-border);
+				box-shadow: -2px 0 8px rgba(0, 0, 0, 0.1);
+				transition: right 0.3s ease;
+				z-index: 1001;
+				overflow-y: auto;
+			}
+
+			.input-link-panel.open {
+				right: 0;
+			}
+
+			.toolbar-btn.link-active {
+				background: rgba(46, 204, 113, 0.3);
+				border-color: #2ecc71;
+			}
+
+			/* 見積テーブル */
+			.estimate-table-wrap {
+				overflow-x: auto;
+				border: 1px solid var(--panel-border);
+				border-radius: 4px;
+				margin-top: 4px;
+			}
+
+			.estimate-table {
+				width: 100%;
+				border-collapse: collapse;
+				font-size: 11px;
+				font-family: var(--sans);
+				min-width: 360px;
+			}
+
+			.estimate-table th {
+				background: #4a90e2;
+				color: white;
+				padding: 6px 8px;
+				text-align: left;
+				font-weight: 600;
+				white-space: nowrap;
+			}
+
+			.estimate-table td {
+				padding: 5px 8px;
+				border-bottom: 1px solid #e8e8e8;
+				vertical-align: top;
+				word-break: break-word;
+			}
+
+			.estimate-table tr:nth-child(even) td {
+				background: #f8f9fa;
+			}
+
+			.estimate-table tr:hover td {
+				background: #e8f4fd;
+			}
+
+			.col-pill {
+				display: inline-block;
+				background: #e8f0fe;
+				border: 1px solid #c5d2f1;
+				border-radius: 3px;
+				padding: 2px 7px;
+				margin: 2px;
+				font-size: 12px;
+			}
+
+			.col-pill-wrap {
+				line-height: 1.9;
+			}
+
+			.input-link-hint {
+				font-size: 11px;
+				color: #888;
+				margin-top: 8px;
+			}
+
+			.input-link-desc {
+				font-size: 12px;
+				color: #555;
+				line-height: 1.6;
+			}
+
+			.btn-full {
+				width: 100%;
+			}
 		</style>
 	</head>
 	<body>
@@ -816,6 +910,7 @@
 				
 				<div class="toolbar-group">
 					<button class="toolbar-btn" id="settingsBtn">詳細設定</button>
+					<button class="toolbar-btn" id="inputLinkBtn">入力連携</button>
 					<button class="toolbar-btn hidden" id="clearSelectionBtn">選択解除</button>
 				</div>
 			</div>
@@ -1194,6 +1289,29 @@
 			</div>
 		</div>
 
+		<!-- 入力連携パネル -->
+		<div class="input-link-panel" id="inputLinkPanel">
+			<div class="settings-header">
+				<h3>入力連携設定</h3>
+				<button class="btn btn-small" id="closeInputLinkBtn">×</button>
+			</div>
+			<div class="settings-content">
+				<div class="form-section">
+					<h3>連携モード</h3>
+					<div class="form-field">
+						<label>モード選択</label>
+						<select id="inputLinkMode" title="連携モード選択">
+							<option value="none" selected>なし（通常OCR）</option>
+						</select>
+					</div>
+				</div>
+
+				<div class="form-section">
+					<button type="button" class="btn btn-primary btn-full" id="applyInputLinkBtn">適用して閉じる</button>
+				</div>
+			</div>
+		</div>
+
 		<!-- Hidden elements for status -->
 		<div class="hidden">
 			<span id="statusModel">model: -</span>
@@ -1264,11 +1382,20 @@
 			const resultLayout = document.getElementById("resultLayout");
 			const resultOrder = document.getElementById("resultOrder");
 
+			// 入力連携関連要素
+			const inputLinkBtn = document.getElementById("inputLinkBtn");
+			const inputLinkPanel = document.getElementById("inputLinkPanel");
+			const closeInputLinkBtn = document.getElementById("closeInputLinkBtn");
+			const inputLinkModeSelect = document.getElementById("inputLinkMode");
+			const applyInputLinkBtn = document.getElementById("applyInputLinkBtn");
+
 			// State variables
 			let currentResults = [];
 			let resultHistory = [];
 			let progressPollTimer = null;
 			let activeRequestId = null;
+			// VB.NET起動時にURLパラメータで渡されるsession_id。ブラウザ単体起動時はnull。
+			const _vbnetSessionId = new URLSearchParams(window.location.search).get("session_id") || null;
 			let currentViewItem = null;
 			let currentViewLabel = "";
 			let copyFeedbackTimer = null;
@@ -1282,6 +1409,13 @@
 				layoutBackend: "-",
 			};
 			const helpTriggers = Array.from(document.querySelectorAll(".help-trigger"));
+
+			// 入力連携状態
+			let inputLinkState = { mode: 'none' };
+			let estimateRows = null;
+
+			// 入力連携モード設定 (app/static/input_link_modes.json から読み込む)
+			let inputLinkModes = [];
 
 			// Selection state
 			let selectionState = {
@@ -1322,11 +1456,109 @@
 
 			// UI Functions
 			function showSettings() {
+				hideInputLinkPanel();
 				settingsPanel.classList.add('open');
 			}
 
 			function hideSettings() {
 				settingsPanel.classList.remove('open');
+			}
+
+			// 入力連携パネルの開閉
+			function showInputLinkPanel() {
+				hideSettings();
+				// 現在の連携モードをセレクトに反映
+				inputLinkModeSelect.value = inputLinkState.mode;
+				updateInputLinkModeInfo();
+				inputLinkPanel.classList.add('open');
+			}
+
+			function hideInputLinkPanel() {
+				inputLinkPanel.classList.remove('open');
+			}
+
+			function updateInputLinkModeInfo() {
+				const mode = inputLinkModeSelect.value;
+				inputLinkPanel.querySelectorAll('.mode-info-section').forEach(s => {
+					s.classList.toggle('hidden', s.dataset.modeId !== mode);
+				});
+			}
+
+			function updateInputLinkBtnState() {
+				const cfg = inputLinkModes.find(m => m.id === inputLinkState.mode);
+				if (cfg) {
+					inputLinkBtn.textContent = `入力連携: ${cfg.label}`;
+					inputLinkBtn.classList.add('link-active');
+				} else {
+					inputLinkBtn.textContent = '入力連携';
+					inputLinkBtn.classList.remove('link-active');
+				}
+			}
+
+			function applyInputLink() {
+				inputLinkState.mode = inputLinkModeSelect.value;
+				const cfg = inputLinkModes.find(m => m.id === inputLinkState.mode);
+				if (cfg && cfg.columns && cfg.columns.length > 0) {
+					taskInput.value = 'extract_json';
+					const sample = {};
+					cfg.columns.forEach(c => { sample[c] = ''; });
+					schemaInput.value = JSON.stringify([sample]);
+					toggleSchema();
+				}
+				updateInputLinkBtnState();
+				hideInputLinkPanel();
+			}
+
+			// 列指定テーブルで描画する（入力連携モード共通）
+			function renderColumnarTable(rows, columns, label) {
+				if (!textResult) return;
+				// rows が空の場合は呼び出し側でガードするが、念のためフォールバック
+				if (!Array.isArray(rows) || rows.length === 0) {
+					renderResultHistory();
+					return;
+				}
+				textResult.innerHTML = '';
+				const header = document.createElement('div');
+				header.className = 'input-link-hint';
+				header.style.cssText = 'padding:4px 0;color:#666;';
+				header.textContent = `${rows.length}行 抽出 (${label})`;
+				textResult.appendChild(header);
+				const wrap = document.createElement('div');
+				wrap.className = 'estimate-table-wrap';
+				const table = document.createElement('table');
+				table.className = 'estimate-table';
+				const thead = document.createElement('thead');
+				const headerRow = document.createElement('tr');
+				columns.forEach(col => {
+					const th = document.createElement('th');
+					th.textContent = col;
+					headerRow.appendChild(th);
+				});
+				thead.appendChild(headerRow);
+				table.appendChild(thead);
+				const tbody = document.createElement('tbody');
+				rows.forEach(row => {
+					const tr = document.createElement('tr');
+					columns.forEach(col => {
+						const td = document.createElement('td');
+						td.textContent = String(row[col] ?? '');
+						tr.appendChild(td);
+					});
+					tbody.appendChild(tr);
+				});
+				table.appendChild(tbody);
+				wrap.appendChild(table);
+				textResult.appendChild(wrap);
+			}
+
+			// 列指定TSV文字列に変換する（入力連携モード共通）
+			function buildColumnarTSV(rows, columns) {
+				if (!Array.isArray(rows) || rows.length === 0) return '';
+				const header = columns.join('\t');
+				const lines = rows.map(row =>
+					columns.map(col => String(row[col] ?? '').replace(/\t/g, ' ')).join('\t')
+				);
+				return [header, ...lines].join('\n');
 			}
 
 			document.addEventListener("click", (event) => {
@@ -1952,7 +2184,13 @@
 			}
 
 			async function copyCurrentView() {
-				const text = buildCopyText(currentViewItem, currentViewLabel);
+				let text;
+				const _copyCfg = inputLinkModes.find(m => m.id === inputLinkState.mode);
+				if (_copyCfg && _copyCfg.columns && estimateRows !== null) {
+					text = buildColumnarTSV(estimateRows, _copyCfg.columns);
+				} else {
+					text = buildCopyText(currentViewItem, currentViewLabel);
+				}
 				if (!text) return;
 
 				try {
@@ -2012,6 +2250,9 @@
 			function clearResults() {
 				resultHistory = [];
 				renderResultHistory();
+				estimateRows = null;
+				inputLinkState.mode = 'none';
+				updateInputLinkBtnState();
 
 				// ファイルをクリア
 				if (fileInput) {
@@ -2384,6 +2625,9 @@
 				formData.append("max_regions", maxRegionsInput.value);
 				formData.append("region_parallelism", regionParallelismInput.value);
 				formData.append("request_id", requestId);
+				if (_vbnetSessionId) {
+					formData.append("session_id", _vbnetSessionId);
+				}
 				
 				if (taskNeedsSchema(taskInput.value)) {
 					formData.append("schema", schemaInput.value);
@@ -2473,6 +2717,27 @@
 					} else {
 						renderPageSelector(currentResults);
 						renderAllPages(true);
+						// 入力連携モードの場合はテーブル描画に切り替える
+						const _ocrCfg = inputLinkModes.find(m => m.id === inputLinkState.mode);
+						if (_ocrCfg && _ocrCfg.columns && _ocrCfg.columns.length > 0) {
+							estimateRows = [];
+							currentResults.forEach(item => {
+								if (Array.isArray(item.json)) {
+									estimateRows.push(...item.json);
+								} else if (item.json && typeof item.json === 'object') {
+									// モデルが配列をオブジェクトで包んで返した場合への対応
+									for (const val of Object.values(item.json)) {
+										if (Array.isArray(val)) { estimateRows.push(...val); break; }
+									}
+								}
+							});
+							// 抽出できた行があるときのみテーブル描画
+							// 数が0のときは renderAllPages(true) が書いた OCR 履歴テキストをそのまま表示
+							if (estimateRows.length > 0) {
+								renderColumnarTable(estimateRows, _ocrCfg.columns, _ocrCfg.label);
+							}
+							copyBtn.disabled = false;
+						}
 					}
 					
 					if (payload.state === "canceled") {
@@ -2502,6 +2767,19 @@
 
 			settingsBtn.addEventListener("click", showSettings);
 			closeSettingsBtn.addEventListener("click", hideSettings);
+
+			// 入力連携パネルイベント
+			inputLinkBtn.addEventListener('click', showInputLinkPanel);
+			closeInputLinkBtn.addEventListener('click', hideInputLinkPanel);
+			inputLinkModeSelect.addEventListener('change', updateInputLinkModeInfo);
+			applyInputLinkBtn.addEventListener('click', applyInputLink);
+			document.addEventListener('click', (event) => {
+				if (!inputLinkPanel.classList.contains('open')) return;
+				const target = event.target;
+				if (!(target instanceof Node)) return;
+				if (inputLinkPanel.contains(target) || inputLinkBtn.contains(target)) return;
+				hideInputLinkPanel();
+			});
 
 			clearBtn.addEventListener("click", clearResults);
 			clearResultBtn.addEventListener("click", clearResults);
@@ -2556,6 +2834,63 @@
 				});
 			}
 
+			// 入力連携モード設定を app/static/input_link_modes.json から読み込んでUIを構築する
+			async function loadInputLinkConfig() {
+				try {
+					const resp = await fetch('/static/input_link_modes.json');
+					if (!resp.ok) {
+						console.warn('入力連携設定の読み込み失敗:', resp.status);
+						return;
+					}
+					inputLinkModes = await resp.json();
+
+					// select にオプションを追加（none 以外）
+					while (inputLinkModeSelect.options.length > 1) inputLinkModeSelect.remove(1);
+					inputLinkModes.forEach(m => {
+						const opt = document.createElement('option');
+						opt.value = m.id;
+						opt.textContent = m.label;
+						inputLinkModeSelect.appendChild(opt);
+					});
+
+					// モード情報セクションを動的生成
+					const settingsContent = inputLinkPanel.querySelector('.settings-content');
+					const applySection = settingsContent.querySelector('.form-section:last-child');
+					// 既存の動的セクションをクリア（再読み込み対策）
+					settingsContent.querySelectorAll('.mode-info-section').forEach(s => s.remove());
+					inputLinkModes.forEach(m => {
+						const section = document.createElement('div');
+						section.className = 'form-section hidden mode-info-section';
+						section.dataset.modeId = m.id;
+
+						const h3 = document.createElement('h3');
+						h3.textContent = `${m.label} — 出力列`;
+						section.appendChild(h3);
+
+						const pillWrap = document.createElement('div');
+						pillWrap.className = 'col-pill-wrap';
+						(m.columns || []).forEach(col => {
+							const pill = document.createElement('span');
+							pill.className = 'col-pill';
+							pill.textContent = col;
+							pillWrap.appendChild(pill);
+						});
+						section.appendChild(pillWrap);
+
+						if (m.description) {
+							const hint = document.createElement('div');
+							hint.className = 'input-link-hint';
+							hint.textContent = m.description;
+							section.appendChild(hint);
+						}
+
+						settingsContent.insertBefore(section, applySection);
+					});
+				} catch (e) {
+					console.warn('入力連携設定の読み込みに失敗しました:', e);
+				}
+			}
+
 			// Initialize
 			// PDF.js setup
 			if (typeof pdfjsLib !== 'undefined') {
@@ -2573,6 +2908,7 @@
 			setupHelpBubbles();
 			setupFileDropzone();
 			fetchStatus();
+			void loadInputLinkConfig();
 
 			// Additional event listeners
 			if (clearSelectionBtn) {
