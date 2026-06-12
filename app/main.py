@@ -1,7 +1,5 @@
 import base64
 import asyncio
-import csv
-import difflib
 import io
 import json
 import logging
@@ -14,7 +12,17 @@ from pathlib import Path
 from typing import Any, Optional, cast
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -669,88 +677,215 @@ _SESSION_RESULTS: dict[str, dict[str, Any]] = {}
 _SESSION_TIMESTAMPS: dict[str, float] = {}  # {session_id: stored_at}
 MAX_SESSION_ENTRIES = 100
 _LATEST_RESULT: Optional[dict[str, Any]] = None  # ブラウザ単体起動用（最新1件のみ保持）
-
-# ---- 候補マッチング ----
-
-CANDIDATES_CSV_PATH = Path(
-    os.getenv("CANDIDATES_CSV", str(ROOT_DIR / "商品リスト.csv"))
-)
-DEFAULT_MATCH_TOP_K = 30
-
-_CANDIDATES_CACHE: Optional[list[dict[str, str]]] = None
+# {connection_id: response}
+_CONNECTION_RESULTS: dict[str, dict[str, Any]] = {}
+_CONNECTION_TIMESTAMPS: dict[str, float] = {}  # {connection_id: stored_at}
+MAX_CONNECTION_ENTRIES = 300
+_WS_CONNECTIONS: dict[str, WebSocket] = {}  # {connection_id: websocket}
 
 
-# 商品リストCSVを読み込んでキャッシュする。エンコーディングは自動判定。
-def load_candidates(force_reload: bool = False) -> list[dict[str, str]]:
-    global _CANDIDATES_CACHE
-    if _CANDIDATES_CACHE is not None and not force_reload:
-        return _CANDIDATES_CACHE
-    if not CANDIDATES_CSV_PATH.exists():
-        logger.warning("候補リストCSVが見つかりません: %s", CANDIDATES_CSV_PATH)
-        _CANDIDATES_CACHE = []
-        return []
-    rows: list[dict[str, str]] = []
-    for enc in ("utf-8-sig", "utf-8", "shift_jis", "cp932"):
-        try:
-            with open(CANDIDATES_CSV_PATH, encoding=enc, newline="") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # ヘッダースキップ
-                for row in reader:
-                    if len(row) < 4:
-                        continue
-                    shohincd = row[0].strip()
-                    subcd    = row[1].strip()
-                    shohinnm = row[2].strip()
-                    kikaku   = row[3].strip()
-                    rows.append({
-                        "shohincd": shohincd,
-                        "subcd":    subcd,
-                        "shohinnm": shohinnm,
-                        "kikaku":   kikaku,
-                        "search_key": f"{shohinnm} {kikaku}".strip(),
-                    })
-            break
-        except (UnicodeDecodeError, UnicodeError):
-            rows = []
+def normalize_connection_id(raw_value: Optional[str]) -> Optional[str]:
+    token = (raw_value or "").strip()
+    if not token:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", token):
+        return None
+    return token
+
+
+def store_scoped_result(
+    store: dict[str, dict[str, Any]],
+    timestamps: dict[str, float],
+    key: str,
+    value: dict[str, Any],
+    max_entries: int,
+) -> None:
+    store[key] = value
+    timestamps[key] = time.time()
+    if len(store) <= max_entries:
+        return
+    overflow = len(store) - max_entries
+    oldest = sorted(timestamps.items(), key=lambda x: x[1])[:overflow]
+    for old_key, _ in oldest:
+        store.pop(old_key, None)
+        timestamps.pop(old_key, None)
+
+
+LISTVIEW_COLUMNS = ["品番", "部品名", "材質", "処理", "個数"]
+
+
+def normalize_field_name(name: str) -> str:
+    if not name:
+        return ""
+    lowered = str(name).strip().lower()
+    return re.sub(r"[\s_／/・\-　\(\)（）\[\]{}]+", "", lowered)
+
+
+def _pick_first_value(row: dict[str, Any], aliases: set[str]) -> str:
+    for key, value in row.items():
+        if normalize_field_name(str(key)) not in aliases:
             continue
-    _CANDIDATES_CACHE = rows
-    logger.info("候補リストを読み込みました: %d 件 (%s)", len(rows), CANDIDATES_CSV_PATH)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _iter_row_dicts_from_page(page_result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = page_result.get("json")
+    rows: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                rows.append(item)
+        return rows
+
+    if not isinstance(raw, dict):
+        return rows
+
+    scalar_values = all(
+        not isinstance(v, (dict, list))
+        for v in raw.values()
+    )
+    if scalar_values:
+        rows.append(raw)
+        return rows
+
+    for value in raw.values():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    rows.append(item)
     return rows
 
 
-# OCRテキストとの文字列類似度でtop_k件に絞り込む。
-def prefilter_candidates(
-    ocr_text: str,
-    candidates: list[dict[str, str]],
-    top_k: int,
-) -> list[dict[str, str]]:
-    if not candidates:
+def _iter_text_lines_from_page(page_result: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key in ("text", "raw"):
+        value = page_result.get(key)
+        if not isinstance(value, str):
+            continue
+        for line in value.splitlines():
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    return lines
+
+
+def _parse_listview_row_from_text_line(line: str) -> Optional[dict[str, str]]:
+    if not line:
+        return None
+
+    # ヘッダー行は除外する（OCR空白揺れを normalize_field_name で吸収）。
+    normalized = normalize_field_name(line)
+    if all(token in normalized for token in ("品番", "部品名", "材質", "処理", "個数")):
+        return None
+
+    match = re.match(
+        r"^(?P<hinban>\S+)\s+(?P<body>.+?)\s+(?P<qty>\d+)\s*本\s*$", line)
+    if not match:
+        return None
+
+    hinban = match.group("hinban").strip()
+    qty = match.group("qty").strip()
+    body_tokens = [token for token in match.group("body").split() if token]
+    if len(body_tokens) < 2:
+        return None
+
+    process = ""
+    material = ""
+    name = ""
+    if len(body_tokens) >= 3:
+        process = body_tokens[-1]
+        material = body_tokens[-2]
+        name = " ".join(body_tokens[:-2]).strip()
+    else:
+        material = body_tokens[-1]
+        name = " ".join(body_tokens[:-1]).strip()
+
+    if not (hinban and name and material and qty):
+        return None
+
+    return {
+        "品番": hinban,
+        "部品名": name,
+        "材質": material,
+        "処理": process,
+        "個数": qty,
+    }
+
+
+def build_listview_rows(results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    if not results:
         return []
-    query = ocr_text.lower()
-    scored = [
-        (difflib.SequenceMatcher(None, query, c["search_key"].lower()).ratio(), i)
-        for i, c in enumerate(candidates)
-    ]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [candidates[i] for _, i in scored[:top_k]]
+
+    aliases_hinban = {
+        normalize_field_name(k)
+        for k in ["品番", "部品番号", "部番", "part_no", "partnumber", "hinban", "shohincd"]
+    }
+    aliases_name = {
+        normalize_field_name(k)
+        for k in ["部品名", "品名", "名称", "name", "part_name", "partname", "shohinnm"]
+    }
+    aliases_material = {
+        normalize_field_name(k)
+        for k in ["材質", "材", "material", "zaishitsu"]
+    }
+    aliases_process = {
+        normalize_field_name(k)
+        for k in ["処理", "表面処理", "処置", "process", "shori"]
+    }
+    aliases_qty = {
+        normalize_field_name(k)
+        for k in ["個数", "数量", "数", "qty", "quantity", "kosu"]
+    }
+
+    normalized_rows: list[dict[str, str]] = []
+    for page_result in results:
+        page_rows = _iter_row_dicts_from_page(page_result)
+        if page_rows:
+            for row in page_rows:
+                item = {
+                    "品番": _pick_first_value(row, aliases_hinban),
+                    "部品名": _pick_first_value(row, aliases_name),
+                    "材質": _pick_first_value(row, aliases_material),
+                    "処理": _pick_first_value(row, aliases_process),
+                    "個数": _pick_first_value(row, aliases_qty),
+                }
+                if any(item.values()):
+                    normalized_rows.append(item)
+            continue
+
+        # JSON行が無いページのみ、VB.NET移行期向けにテキスト行フォールバックを試す。
+        for line in _iter_text_lines_from_page(page_result):
+            fallback_item = _parse_listview_row_from_text_line(line)
+            if fallback_item is not None:
+                normalized_rows.append(fallback_item)
+
+    return normalized_rows
 
 
-# 絞り込んだ候補リストを埋め込んだマッチング用プロンプトを組み立てる。
-def build_match_prompt(candidates: list[dict[str, str]]) -> str:
-    lines = [
-        f"{i + 1}. [{c['shohincd']}/{c['subcd']}] {c['shohinnm']} / {c['kikaku']}"
-        for i, c in enumerate(candidates)
-    ]
-    return (
-        "以下の候補リストから、画像に写っているテキストに最も合致するものを1つ選んでください。\n\n"
-        "候補リスト:\n" + "\n".join(lines) + "\n\n"
-        "最も合致する候補について、以下のJSON形式のみで出力してください（説明不要）:\n"
-        '{"no": 番号, "shohincd": "コード", "subcd": "サブコード", '
-        '"shohinnm": "商品名", "kikaku": "規格", "confidence": "high/medium/low"}'
-    )
+def build_latest_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    response_results = result.get("results", [])
+    if not isinstance(response_results, list):
+        response_results = []
 
+    listview_rows = build_listview_rows(response_results)
+    return {
+        "results": response_results,
+        "listview": {
+            "columns": LISTVIEW_COLUMNS,
+            "rows": listview_rows,
+            "row_count": len(listview_rows),
+        },
+        "listview_rows": listview_rows,
+    }
 
 # リクエスト進捗状態を保存し、上限を超えた古い履歴を間引く。
+
+
 def set_progress(
     request_id: str,
     state: str,
@@ -856,6 +991,44 @@ app = FastAPI(
     version="2.0.0",
 )
 
+
+@app.websocket("/ws/session")
+async def ws_session(websocket: WebSocket) -> None:
+    requested_id = normalize_connection_id(
+        websocket.query_params.get("connection_id")
+    )
+    connection_id = requested_id or uuid.uuid4().hex
+
+    await websocket.accept()
+
+    old_socket = _WS_CONNECTIONS.get(connection_id)
+    if old_socket is not None and old_socket is not websocket:
+        try:
+            await old_socket.close(code=1000)
+        except Exception:
+            pass
+
+    _WS_CONNECTIONS[connection_id] = websocket
+    _CONNECTION_TIMESTAMPS[connection_id] = time.time()
+    await websocket.send_json({"type": "connected", "connection_id": connection_id})
+
+    try:
+        while True:
+            message = await websocket.receive_text()
+            _CONNECTION_TIMESTAMPS[connection_id] = time.time()
+            if message == "ping":
+                await websocket.send_json({"type": "pong", "connection_id": connection_id})
+            elif message == "get_connection_id":
+                await websocket.send_json(
+                    {"type": "connected", "connection_id": connection_id}
+                )
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("WebSocketセッション処理でエラーが発生しました")
+    finally:
+        _WS_CONNECTIONS.pop(connection_id, None)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -881,9 +1054,57 @@ async def get_authenticated_user(request: Request) -> Optional[dict[str, Any]]:
     return cast(Optional[dict[str, Any]], user)
 
 
+@app.get("/api/user/sessions")
+async def get_user_sessions(
+    request: Request,
+    user_id: Optional[str] = Query(None, description="ユーザーID")
+) -> dict[str, Any]:
+    """
+    指定されたユーザーIDに関連付けられたアクティブなconnection_idのリストを返す
+    VB.NETアプリからユーザーのアクティブセッション一覧を取得するために使用
+    """
+    # 認証チェック（必要に応じて有効化）
+    # authenticated_user = await get_authenticated_user(request)
+    # if not authenticated_user and not user_id:
+    #     raise HTTPException(status_code=401, detail="認証が必要です")
+
+    # 簡易実装: user_idをそのまま使用（実際の実装では認証ユーザーと照合）
+    target_user_id = user_id
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail="user_idパラメータが必要です")
+
+    logger.info(f"/api/user/sessions called for user_id={target_user_id}")
+
+    # アクティブなconnection_idとそのメタデータを返す
+    active_sessions = []
+    current_time = time.time()
+
+    # _CONNECTION_TIMESTAMPSからアクティブなセッションを取得
+    for conn_id, timestamp in list(_CONNECTION_TIMESTAMPS.items()):
+        # 1時間以内のセッションのみ返す
+        if current_time - timestamp < 3600:
+            result = _CONNECTION_RESULTS.get(conn_id)
+            active_sessions.append({
+                "connection_id": conn_id,
+                "timestamp": timestamp,
+                "has_result": result is not None,
+                "result_pages": len(result.get("results", [])) if result else 0
+            })
+
+    # タイムスタンプの降順でソート（新しいものが先）
+    active_sessions.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    logger.info(
+        f"/api/user/sessions returning {len(active_sessions)} sessions for user_id={target_user_id}")
+
+    return {
+        "user_id": target_user_id,
+        "sessions": active_sessions
+    }
+
+
 @app.middleware("http")
 async def require_login_for_app(request: Request, call_next):
-    return await call_next(request)  # TODO: 一時的に認証を無効化 — 本番前に削除すること
     if OAUTH_CLIENT is None or request.method == "OPTIONS":
         return await call_next(request)
 
@@ -913,7 +1134,6 @@ async def startup_load_model() -> None:
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     default_device = resolve_device("auto")
     await RUNTIME.ensure_loaded(default_device)
-    load_candidates()
     logger.info(
         "起動完了 (デバイス=%s, キャッシュディレクトリ=%s)",
         default_device,
@@ -961,192 +1181,37 @@ async def cancel(request_id: str) -> dict[str, Any]:
     return request_cancel(request_id)
 
 
-@app.get("/api/candidates/status")
-# 候補リストの読み込み状態を返す。
-async def candidates_status() -> dict[str, Any]:
-    candidates = load_candidates()
-    return {
-        "count": len(candidates),
-        "path": str(CANDIDATES_CSV_PATH),
-        "loaded": len(candidates) > 0,
-    }
-
-
-@app.post("/api/candidates/reload")
-# 商品リストCSVをディスクから再読み込みする。
-async def candidates_reload() -> dict[str, Any]:
-    rows = await asyncio.to_thread(load_candidates, True)
-    return {"count": len(rows), "path": str(CANDIDATES_CSV_PATH)}
-
-
-@app.post("/api/match")
-# 画像からテキストを読み取り、商品リストから最も近い候補をGLMで推論して返す。
-# Pass 1: GLMでOCR → Pass 2: top_k件に絞り込みGLMでマッチング
-async def match_product(
-    file: UploadFile = File(...),
-    device: str = Form("auto"),
-    dpi: int = Form(DEFAULT_DPI),
-    top_k: int = Form(DEFAULT_MATCH_TOP_K),
-    max_new_tokens: int = Form(512),
-    temperature: float = Form(DEFAULT_TEMPERATURE),
-    request_id: Optional[str] = Form(None),
-) -> dict[str, Any]:
-    request_id = (request_id or "").strip() or uuid.uuid4().hex
-    clear_cancel_request(request_id)
-    set_progress(request_id, "preprocessing", "事前処理中", 0, 2)
-
-    normalized_top_k = max(1, min(100, int(top_k or DEFAULT_MATCH_TOP_K)))
-    normalized_max_new_tokens = max(1, min(4096, int(max_new_tokens or 512)))
-    normalized_dpi = max(36, min(600, int(dpi or DEFAULT_DPI)))
-
-    candidates = load_candidates()
-    if not candidates:
-        raise HTTPException(
-            status_code=503,
-            detail=f"候補リストが見つかりません: {CANDIDATES_CSV_PATH}",
-        )
-
-    resolved_device = resolve_device(device)
-    try:
-        await RUNTIME.ensure_loaded(resolved_device)
-        processor, model, actual_device = RUNTIME.get()
-    except Exception as exc:
-        clear_cancel_request(request_id)
-        set_progress(request_id, "error", str(exc), 0, 2)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    input_path: Optional[Path] = None
-    try:
-        content = await file.read()
-        input_path = save_temp_upload(file.filename or "upload.bin", content)
-        page_tuples = load_pages(input_path, normalized_dpi)
-    except Exception as exc:
-        clear_cancel_request(request_id)
-        set_progress(request_id, "error", f"事前処理エラー: {exc}", 0, 2)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        if input_path is not None:
-            input_path.unlink(missing_ok=True)
-
-    if not page_tuples:
-        raise HTTPException(status_code=400, detail="ページが見つかりません")
-
-    _, page_image = page_tuples[0]
-    page_path: Optional[Path] = None
-    ocr_text = ""
-    raw_match = ""
-    clean_match = ""
-    try:
-        page_path = save_temp_png(page_image)
-
-        # Pass 1: テキスト認識
-        set_progress(request_id, "ocr", "テキスト認識中 (1/2)", 1, 2)
-        async with GENERATE_SEMAPHORE:
-            _, ocr_text, _ = await asyncio.to_thread(
-                glm_infer,
-                processor,
-                model,
-                str(page_path),
-                "Text Recognition:",
-                normalized_max_new_tokens,
-                float(temperature),
-                request_id,
-            )
-
-        if is_cancel_requested(request_id):
-            set_progress(request_id, "canceled", "中断しました", 1, 2)
-            clear_cancel_request(request_id)
-            return {"request_id": request_id, "state": "canceled", "matched": None}
-
-        # CPU側で候補を絞り込む
-        filtered = await asyncio.to_thread(
-            prefilter_candidates, ocr_text, candidates, normalized_top_k
-        )
-        match_prompt = build_match_prompt(filtered)
-
-        # Pass 2: 候補マッチング
-        set_progress(request_id, "ocr", "候補マッチング中 (2/2)", 2, 2)
-        async with GENERATE_SEMAPHORE:
-            raw_match, clean_match, _ = await asyncio.to_thread(
-                glm_infer,
-                processor,
-                model,
-                str(page_path),
-                match_prompt,
-                normalized_max_new_tokens,
-                float(temperature),
-                request_id,
-            )
-    except HTTPException:
-        clear_cancel_request(request_id)
-        set_progress(request_id, "error", "APIエラー", 0, 2)
-        raise
-    except Exception as exc:
-        clear_cancel_request(request_id)
-        logger.exception("マッチング推論に失敗しました")
-        set_progress(request_id, "error", f"推論エラー: {exc}", 0, 2)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        if page_path is not None:
-            page_path.unlink(missing_ok=True)
-
-    if is_cancel_requested(request_id):
-        set_progress(request_id, "canceled", "中断しました", 2, 2)
-        clear_cancel_request(request_id)
-        return {"request_id": request_id, "state": "canceled", "matched": None}
-
-    # GLM出力からJSONを抽出
-    matched: Optional[dict[str, Any]] = None
-    parse_error: Optional[str] = None
-    try:
-        json_hit = re.search(r"\{[^{}]*\}", clean_match, re.DOTALL)
-        if json_hit:
-            matched = json.loads(json_hit.group())
-            # no フィールドで候補を補完（モデルが省略した場合のフォールバック）
-            no = int(matched.get("no", 0)) - 1
-            if 0 <= no < len(filtered):
-                ref = filtered[no]
-                matched.setdefault("shohincd", ref["shohincd"])
-                matched.setdefault("subcd",    ref["subcd"])
-                matched.setdefault("shohinnm", ref["shohinnm"])
-                matched.setdefault("kikaku",   ref["kikaku"])
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        parse_error = str(exc)
-
-    set_progress(request_id, "done", "完了", 2, 2)
-    clear_cancel_request(request_id)
-
-    return {
-        "request_id":      request_id,
-        "state":           "done",
-        "device":          actual_device,
-        "ocr_text":        ocr_text,
-        "matched":         matched,
-        "candidates_shown": [{"no": i + 1, **c} for i, c in enumerate(filtered)],
-        "raw_response":    raw_match,
-        "parse_error":     parse_error,
-    }
-
-
+@app.get("/api/latest_result")
 # session_id指定時（VB.NET連携）はセッション結果を返す。未指定時（ブラウザ単体）は直近の結果を返す。
 async def latest_result(
+    connection_id: Optional[str] = Query(
+        None, description="WebSocket接続ID（ブラウザインスタンス単位）"
+    ),
     session_id: Optional[str] = Query(
         None, description="VB.NETアプリが発行したセッションID"),
 ) -> dict[str, Any]:
+    normalized_connection_id = normalize_connection_id(connection_id)
+    if normalized_connection_id:
+        result = _CONNECTION_RESULTS.get(normalized_connection_id)
+        if result is not None:
+            return build_latest_result_payload(result)
+        raise HTTPException(
+            status_code=404, detail="指定connection_idの解析結果がありません")
+
     if session_id:
         # VB.NET連携モード: セッションキーで検索、見つからなければ直近結果にフォールバック
         result = _SESSION_RESULTS.get(session_id)
         if result is not None:
-            return {"results": result.get("results", [])}
+            return build_latest_result_payload(result)
         logger.info(
             "/api/latest_result: session_id=%s not found, falling back to latest", session_id)
         if _LATEST_RESULT is not None:
-            return {"results": _LATEST_RESULT.get("results", [])}
+            return build_latest_result_payload(_LATEST_RESULT)
         raise HTTPException(status_code=404, detail="まだ解析結果がありません")
     # ブラウザ単体モード: 直近の1件を返す
     if _LATEST_RESULT is None:
         raise HTTPException(status_code=404, detail="まだ解析結果がありません")
-    return {"results": _LATEST_RESULT.get("results", [])}
+    return build_latest_result_payload(_LATEST_RESULT)
 
 
 @app.post("/api/analyze")
@@ -1170,11 +1235,15 @@ async def analyze(
     crop_region: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
+    connection_id: Optional[str] = Form(None),
 ) -> dict[str, Any]:
     request_id = (request_id or "").strip() or uuid.uuid4().hex
     # session_idは Form または URL クエリパラメータのどちらからでも受け取る
     raw_session_id = session_id or request.query_params.get("session_id")
     normalized_session_id = (raw_session_id or "").strip() or None
+    raw_connection_id = connection_id or request.query_params.get(
+        "connection_id")
+    normalized_connection_id = normalize_connection_id(raw_connection_id)
     clear_cancel_request(request_id)
     set_progress(request_id, "preprocessing", "事前処理中", 0, 0)
 
@@ -1611,20 +1680,29 @@ async def analyze(
     clear_cancel_request(request_id)
 
     response = build_response("done", results)
-    # session_id指定時（VB.NET連携）はそのキーでセッション辞書に保存
-    # session_id未指定時（ブラウザ単体）は最新で1件のみ上書き保存
+    # connection_id指定時（WebSocket連携）はそのキーで保存
+    # session_id指定時（VB.NET連携）はそのキーでも保存
+    # どちらも未指定時（ブラウザ単体）は最新で1件のみ上書き保存
     global _LATEST_RESULT
+    stored = False
+    if normalized_connection_id:
+        store_scoped_result(
+            _CONNECTION_RESULTS,
+            _CONNECTION_TIMESTAMPS,
+            normalized_connection_id,
+            response,
+            MAX_CONNECTION_ENTRIES,
+        )
+        stored = True
     if normalized_session_id:
-        _SESSION_RESULTS[normalized_session_id] = response
-        _SESSION_TIMESTAMPS[normalized_session_id] = time.time()
-        # 上限超過時は最古のセッションを間引く
-        if len(_SESSION_RESULTS) > MAX_SESSION_ENTRIES:
-            oldest = sorted(_SESSION_TIMESTAMPS.items(), key=lambda x: x[1])[
-                : len(_SESSION_RESULTS) - MAX_SESSION_ENTRIES
-            ]
-            for sid, _ in oldest:
-                _SESSION_RESULTS.pop(sid, None)
-                _SESSION_TIMESTAMPS.pop(sid, None)
-    else:
+        store_scoped_result(
+            _SESSION_RESULTS,
+            _SESSION_TIMESTAMPS,
+            normalized_session_id,
+            response,
+            MAX_SESSION_ENTRIES,
+        )
+        stored = True
+    if not stored:
         _LATEST_RESULT = response
     return response

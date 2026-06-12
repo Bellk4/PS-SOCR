@@ -1317,6 +1317,7 @@
 			<span id="statusModel">model: -</span>
 			<span id="statusDevice">device: -</span>
 			<span id="statusCuda">cuda: -</span>
+			<span id="statusConnection">connection_id: -</span>
 			<span id="resultTask">task: -</span>
 			<span id="resultLinebreak">linebreak: -</span>
 			<span id="resultPages">pages: -</span>
@@ -1375,6 +1376,7 @@
 			const statusModel = document.getElementById("statusModel");
 			const statusDevice = document.getElementById("statusDevice");
 			const statusCuda = document.getElementById("statusCuda");
+			const statusConnection = document.getElementById("statusConnection");
 			const resultTask = document.getElementById("resultTask");
 			const resultLinebreak = document.getElementById("resultLinebreak");
 			const resultPages = document.getElementById("resultPages");
@@ -1394,6 +1396,11 @@
 			let resultHistory = [];
 			let progressPollTimer = null;
 			let activeRequestId = null;
+			const CONNECTION_ID_STORAGE_KEY = "pssocr.connection_id";
+			let _wsConnectionId = sessionStorage.getItem(CONNECTION_ID_STORAGE_KEY) || null;
+			let _sessionSocket = null;
+			let _sessionSocketPingTimer = null;
+			let _sessionSocketReconnectTimer = null;
 			// VB.NET起動時にURLパラメータで渡されるsession_id。ブラウザ単体起動時はnull。
 			const _vbnetSessionId = new URLSearchParams(window.location.search).get("session_id") || null;
 			let currentViewItem = null;
@@ -1455,6 +1462,97 @@
 			};
 
 			// UI Functions
+			function isValidConnectionId(value) {
+				return typeof value === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value);
+			}
+
+			function syncConnectionIdToUrl() {
+				const currentUrl = new URL(window.location.href);
+				if (isValidConnectionId(_wsConnectionId)) {
+					currentUrl.searchParams.set("connection_id", _wsConnectionId);
+					if (statusConnection) statusConnection.textContent = `connection_id: ${_wsConnectionId}`;
+				} else {
+					currentUrl.searchParams.delete("connection_id");
+					if (statusConnection) statusConnection.textContent = "connection_id: -";
+				}
+				window.history.replaceState(null, "", currentUrl.toString());
+			}
+
+			function stopSessionSocketPing() {
+				if (_sessionSocketPingTimer) {
+					clearInterval(_sessionSocketPingTimer);
+					_sessionSocketPingTimer = null;
+				}
+			}
+
+			function scheduleSessionSocketReconnect() {
+				if (_sessionSocketReconnectTimer) return;
+				_sessionSocketReconnectTimer = setTimeout(() => {
+					_sessionSocketReconnectTimer = null;
+					connectSessionSocket();
+				}, 1500);
+			}
+
+			function connectSessionSocket() {
+				if (_sessionSocket && _sessionSocket.readyState === WebSocket.OPEN) {
+					return;
+				}
+
+				const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+				const wsUrl = new URL(`${protocol}://${window.location.host}/ws/session`);
+				if (isValidConnectionId(_wsConnectionId)) {
+					wsUrl.searchParams.set("connection_id", _wsConnectionId);
+				}
+
+				try {
+					const socket = new WebSocket(wsUrl.toString());
+					_sessionSocket = socket;
+
+					socket.addEventListener("open", () => {
+						stopSessionSocketPing();
+						_sessionSocketPingTimer = setInterval(() => {
+							if (_sessionSocket && _sessionSocket.readyState === WebSocket.OPEN) {
+								_sessionSocket.send("ping");
+							}
+						}, 20000);
+						socket.send("get_connection_id");
+					});
+
+					socket.addEventListener("message", (event) => {
+						try {
+							const payload = JSON.parse(event.data);
+							if (payload && payload.type === "connected" && isValidConnectionId(payload.connection_id)) {
+								_wsConnectionId = payload.connection_id;
+								sessionStorage.setItem(CONNECTION_ID_STORAGE_KEY, _wsConnectionId);
+								syncConnectionIdToUrl();
+							}
+						} catch (_ignored) {
+							// ignore non-JSON messages
+						}
+					});
+
+					socket.addEventListener("close", () => {
+						if (_sessionSocket === socket) {
+							_sessionSocket = null;
+						}
+						stopSessionSocketPing();
+						scheduleSessionSocketReconnect();
+					});
+
+					socket.addEventListener("error", () => {
+						scheduleSessionSocketReconnect();
+					});
+				} catch (_error) {
+					scheduleSessionSocketReconnect();
+				}
+			}
+
+			if (!isValidConnectionId(_wsConnectionId)) {
+				_wsConnectionId = null;
+				sessionStorage.removeItem(CONNECTION_ID_STORAGE_KEY);
+			}
+			syncConnectionIdToUrl();
+
 			function showSettings() {
 				hideInputLinkPanel();
 				settingsPanel.classList.add('open');
@@ -2628,6 +2726,9 @@
 				if (_vbnetSessionId) {
 					formData.append("session_id", _vbnetSessionId);
 				}
+				if (_wsConnectionId) {
+					formData.append("connection_id", _wsConnectionId);
+				}
 				
 				if (taskNeedsSchema(taskInput.value)) {
 					formData.append("schema", schemaInput.value);
@@ -2900,6 +3001,19 @@
 			// Cleanup on page unload (prevent memory leaks)
 			window.addEventListener('beforeunload', () => {
 				cleanupPDFState();
+				stopSessionSocketPing();
+				if (_sessionSocketReconnectTimer) {
+					clearTimeout(_sessionSocketReconnectTimer);
+					_sessionSocketReconnectTimer = null;
+				}
+				if (_sessionSocket) {
+					try {
+						_sessionSocket.close();
+					} catch (_ignored) {
+						// ignore close errors during unload
+					}
+					_sessionSocket = null;
+				}
 			});
 			
 			toggleSchema();
@@ -2908,6 +3022,7 @@
 			setupHelpBubbles();
 			setupFileDropzone();
 			fetchStatus();
+			connectSessionSocket();
 			void loadInputLinkConfig();
 
 			// Additional event listeners

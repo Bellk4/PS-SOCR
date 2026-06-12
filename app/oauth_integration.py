@@ -5,6 +5,7 @@ import secrets
 from pathlib import Path
 from typing import Any, Optional, cast
 
+from auth0_server_python.auth_types import LogoutOptions
 from auth0_server_python.error import MissingTransactionError
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -277,7 +278,12 @@ def register_oauth_routes(
     @router.get(f"{OAUTH_BASE_PATH}/logout")
     async def oauth_logout(request: Request) -> RedirectResponse:
         client = require_oauth_client()
-        logout_url = await client.logout(store_options={"request": request})
+        base_url = str(request.base_url).rstrip("/")
+        return_to = f"{base_url}{OAUTH_BASE_PATH}/login"
+        logout_url = await client.logout(
+            options=LogoutOptions(return_to=return_to),
+            store_options={"request": request},
+        )
         response = RedirectResponse(url=logout_url, status_code=307)
         clear_local_oauth_session(request, response)
         return response
