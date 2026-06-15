@@ -909,7 +909,7 @@
 				</div>
 				
 				<div class="toolbar-group">
-					<button class="toolbar-btn" id="settingsBtn">詳細設定</button>
+					<button class="toolbar-btn hidden" id="settingsBtn">詳細設定</button>
 					<button class="toolbar-btn" id="inputLinkBtn">入力連携</button>
 					<button class="toolbar-btn hidden" id="clearSelectionBtn">選択解除</button>
 				</div>
@@ -918,6 +918,7 @@
 			<div class="toolbar-right">
 				<button class="toolbar-btn primary" id="executeOcrBtn">OCR実行</button>
 				<button class="toolbar-btn" id="clearBtn">クリア</button>
+				<button class="toolbar-btn hidden" id="logoutToolbarBtn">ログアウト</button>
 			</div>
 		</div>
 
@@ -1339,6 +1340,7 @@
 			const closeSettingsBtn = document.getElementById("closeSettingsBtn");
 			const settingsPanel = document.getElementById("settingsPanel");
 			const clearBtn = document.getElementById("clearBtn");
+			const logoutToolbarBtn = document.getElementById("logoutToolbarBtn");
 			const logoutBtn = document.getElementById("logoutBtn");
 			const accountSection = document.getElementById("accountSection");
 			const clearResultBtn = document.getElementById("clearResultBtn");
@@ -1420,6 +1422,17 @@
 			// 入力連携状態
 			let inputLinkState = { mode: 'none' };
 			let estimateRows = null;
+			const ESTIMATE_SCHEMA_PRESET = {
+				"rows": [
+					{
+						"品番": "string",
+						"部品名": "string",
+						"材質": "string",
+						"処理": "string",
+						"個数": "number"
+					}
+				]
+			};
 
 			// 入力連携モード設定 (app/static/input_link_modes.json から読み込む)
 			let inputLinkModes = [];
@@ -1598,13 +1611,40 @@
 				const cfg = inputLinkModes.find(m => m.id === inputLinkState.mode);
 				if (cfg && cfg.columns && cfg.columns.length > 0) {
 					taskInput.value = 'extract_json';
-					const sample = {};
-					cfg.columns.forEach(c => { sample[c] = ''; });
-					schemaInput.value = JSON.stringify([sample]);
+					if (cfg.id === 'estimate') {
+						schemaInput.value = JSON.stringify(ESTIMATE_SCHEMA_PRESET, null, 2);
+					} else {
+						const sample = {};
+						cfg.columns.forEach(c => { sample[c] = ''; });
+						schemaInput.value = JSON.stringify([sample]);
+					}
 					toggleSchema();
 				}
 				updateInputLinkBtnState();
 				hideInputLinkPanel();
+			}
+
+			function applyEstimateInputLinkPreset() {
+				if (inputLinkState.mode === 'estimate') {
+					inputLinkState.mode = 'none';
+					if (inputLinkModeSelect) {
+						inputLinkModeSelect.value = 'none';
+					}
+					taskInput.value = 'text';
+					schemaInput.value = '';
+					toggleSchema();
+					updateInputLinkBtnState();
+					return;
+				}
+
+				inputLinkState.mode = 'estimate';
+				if (inputLinkModeSelect) {
+					inputLinkModeSelect.value = 'estimate';
+				}
+				taskInput.value = 'extract_json';
+				schemaInput.value = JSON.stringify(ESTIMATE_SCHEMA_PRESET, null, 2);
+				toggleSchema();
+				updateInputLinkBtnState();
 			}
 
 			// 列指定テーブルで描画する（入力連携モード共通）
@@ -2082,21 +2122,9 @@
 			}
 
 			function renderPageSelector(results) {
+				// ページ選択機能は運用で使用しないため、常に非表示を維持する。
 				pageSelect.innerHTML = "";
-				const allOption = document.createElement("option");
-				allOption.value = "all";
-				allOption.textContent = "ALL";
-				pageSelect.appendChild(allOption);
-
-				results.forEach((item, index) => {
-					const option = document.createElement("option");
-					option.value = String(index);
-					option.textContent = `Page ${item.page}`;
-					pageSelect.appendChild(option);
-				});
-
-				pageSelect.value = "all";
-				pagePickerWrap.classList.remove("hidden");
+				pagePickerWrap.classList.add("hidden");
 			}
 
 			function combineAllPages(results) {
@@ -2324,11 +2352,18 @@
 					if (logoutBtn) {
 						if (payload.oauth_enabled) {
 							if (accountSection) accountSection.classList.remove("hidden");
+							if (logoutToolbarBtn) logoutToolbarBtn.classList.remove("hidden");
 							logoutBtn.onclick = () => {
 								window.location.href = `${payload.oauth_base_path || "/oauth"}/logout`;
 							};
+							if (logoutToolbarBtn) {
+								logoutToolbarBtn.onclick = () => {
+									window.location.href = `${payload.oauth_base_path || "/oauth"}/logout`;
+								};
+							}
 						} else {
 							if (accountSection) accountSection.classList.add("hidden");
+							if (logoutToolbarBtn) logoutToolbarBtn.classList.add("hidden");
 						}
 					}
 
@@ -2342,6 +2377,7 @@
 				} catch (error) {
 					if (statusCuda) statusCuda.textContent = "cuda: status unavailable";
 					if (accountSection) accountSection.classList.add("hidden");
+					if (logoutToolbarBtn) logoutToolbarBtn.classList.add("hidden");
 				}
 			}
 
@@ -2870,7 +2906,7 @@
 			closeSettingsBtn.addEventListener("click", hideSettings);
 
 			// 入力連携パネルイベント
-			inputLinkBtn.addEventListener('click', showInputLinkPanel);
+			inputLinkBtn.addEventListener('click', applyEstimateInputLinkPreset);
 			closeInputLinkBtn.addEventListener('click', hideInputLinkPanel);
 			inputLinkModeSelect.addEventListener('change', updateInputLinkModeInfo);
 			applyInputLinkBtn.addEventListener('click', applyInputLink);

@@ -81,6 +81,12 @@ rem Configure host/port. Override by setting HOST/PORT before running.
 if "%HOST%"=="" set "HOST=0.0.0.0"
 if "%PORT%"=="" set "PORT=8000"
 
+if /I "%AUTH_DISABLED%"=="1" (
+    echo [+] Authentication is disabled (AUTH_DISABLED=1)
+) else (
+    echo [+] Authentication is enabled
+)
+
 echo [+] Starting server at http://%HOST%:%PORT%
 cd /d "%SCRIPT_DIR%"
 python -m uvicorn app.main:app --host "%HOST%" --port "%PORT%"

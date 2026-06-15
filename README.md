@@ -32,6 +32,22 @@ FastAPI + シンプルなWeb UIで、画像/PDFをページ単位でOCRできま
 
 ## クイックスタート
 
+### 配布・移行時のコピー対象
+
+オンプレサーバーへそのまま移す場合は、以下をコピーしてください。
+
+- [app](app)
+- [run.bat](run.bat)
+- [README.md](README.md)
+- [.env](.env)
+- [models](models)
+
+補足:
+
+- `models` をコピーしておくと、モデルの初回再取得を避けやすくなります。
+- `.venv` はコピーしても動く場合がありますが、環境差分を避けたいなら先方で作り直すのが安全です。
+- `run.bat` は起動時に `.venv` を自動作成し、必要な依存関係とモデルキャッシュを使います。
+
 ### Windows
 
 ```bat
@@ -67,9 +83,15 @@ TORCH_CHANNEL=cu126
 - `HOST`: バインドアドレス（既定 `0.0.0.0`）
 - `PORT`: 起動ポート（既定 `8000`）
 - `TORCH_CHANNEL`: PyTorch配布チャネル（例 `cu126`, `cpu`）
+- `AUTH_DISABLED`: 認証を一時的に外すときに `1` を設定（`0` または未設定で認証有効）
 - `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, `AUTH0_SECRET`, `AUTH0_REDIRECT_URI`: Auth0 ログイン設定
 
 > OAuth 設定も含めて、環境変数は **プロジェクトルートの `.env` に一本化**してください。
+
+認証の切り替えは、`.env` の `AUTH_DISABLED` だけでできます。
+
+- `AUTH_DISABLED=1` で認証を無効化
+- `AUTH_DISABLED=0` または未設定で認証を有効化
 
 ## モデル保存先
 

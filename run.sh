@@ -92,5 +92,11 @@ python -m pip install git+https://github.com/huggingface/transformers.git
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
+if [[ "${AUTH_DISABLED:-0}" =~ ^(1|true|yes|on)$ ]]; then
+  echo "[+] Authentication is disabled (AUTH_DISABLED=${AUTH_DISABLED})"
+else
+  echo "[+] Authentication is enabled"
+fi
+
 echo "[+] Starting server at http://$HOST:$PORT"
 exec python -m uvicorn --app-dir "$SCRIPT_DIR" app.main:app --host "$HOST" --port "$PORT"

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional, cast
 
 import torch
+import httpx
 from fastapi import (
     FastAPI,
     File,
@@ -60,6 +61,10 @@ ALLOWED_TASKS = {"text", "table", "formula", "extract_json"}
 ALLOWED_LINEBREAK_MODES = {"none", "paragraph", "compact"}
 ALLOWED_LAYOUT_BACKENDS = {"ppdoclayoutv3", "none"}
 ALLOWED_READING_ORDERS = {"auto", "ltr_ttb", "rtl_ttb", "vertical_rl"}
+AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
+AUTH0_USERINFO_URL = f"https://{AUTH0_DOMAIN}/userinfo" if AUTH0_DOMAIN else ""
+AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on"}
 
 logger = logging.getLogger("glm_ocr_server")
 logging.basicConfig(level=logging.INFO,
@@ -675,13 +680,19 @@ CANCEL_REQUESTS: set[str] = set()
 # {session_id: response} VB.NET連携用
 _SESSION_RESULTS: dict[str, dict[str, Any]] = {}
 _SESSION_TIMESTAMPS: dict[str, float] = {}  # {session_id: stored_at}
+_SESSION_USER_INDEX: dict[str, str] = {}  # {session_id: user_id}
 MAX_SESSION_ENTRIES = 100
 _LATEST_RESULT: Optional[dict[str, Any]] = None  # ブラウザ単体起動用（最新1件のみ保持）
 # {connection_id: response}
 _CONNECTION_RESULTS: dict[str, dict[str, Any]] = {}
 _CONNECTION_TIMESTAMPS: dict[str, float] = {}  # {connection_id: stored_at}
+_CONNECTION_USER_INDEX: dict[str, str] = {}  # {connection_id: user_id}
 MAX_CONNECTION_ENTRIES = 300
 _WS_CONNECTIONS: dict[str, WebSocket] = {}  # {connection_id: websocket}
+# {user_id: response}
+_USER_RESULTS: dict[str, dict[str, Any]] = {}
+_USER_TIMESTAMPS: dict[str, float] = {}  # {user_id: stored_at}
+MAX_USER_ENTRIES = 300
 
 
 def normalize_connection_id(raw_value: Optional[str]) -> Optional[str]:
@@ -689,6 +700,13 @@ def normalize_connection_id(raw_value: Optional[str]) -> Optional[str]:
     if not token:
         return None
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", token):
+        return None
+    return token
+
+
+def normalize_user_id(raw_value: Optional[str]) -> Optional[str]:
+    token = (raw_value or "").strip()
+    if not token:
         return None
     return token
 
@@ -1044,14 +1062,43 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 async def get_authenticated_user(request: Request) -> Optional[dict[str, Any]]:
-    if OAUTH_CLIENT is None or not has_local_oauth_session(request):
+    if AUTH_DISABLED:
         return None
+
+    if OAUTH_CLIENT is not None and has_local_oauth_session(request):
+        try:
+            user = await OAUTH_CLIENT.get_user({"request": request})
+            return cast(Optional[dict[str, Any]], user)
+        except Exception as exc:
+            logger.warning("OAuthユーザー取得に失敗しました: %s", exc)
+
+    authorization = (request.headers.get("Authorization") or "").strip()
+    if not authorization.lower().startswith("bearer "):
+        return None
+    if not AUTH0_USERINFO_URL:
+        logger.warning("AUTH0_DOMAIN が未設定のため Bearer token を検証できません")
+        return None
+
     try:
-        user = await OAUTH_CLIENT.get_user({"request": request})
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                AUTH0_USERINFO_URL,
+                headers={"Authorization": authorization},
+            )
+        if response.status_code != 200:
+            logger.warning(
+                "Auth0 userinfo 取得に失敗しました: status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+            return None
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        return cast(Optional[dict[str, Any]], payload)
     except Exception as exc:
-        logger.warning("OAuthユーザー取得に失敗しました: %s", exc)
+        logger.warning("Bearer token から OAuth ユーザー取得に失敗しました: %s", exc)
         return None
-    return cast(Optional[dict[str, Any]], user)
 
 
 @app.get("/api/user/sessions")
@@ -1063,15 +1110,17 @@ async def get_user_sessions(
     指定されたユーザーIDに関連付けられたアクティブなconnection_idのリストを返す
     VB.NETアプリからユーザーのアクティブセッション一覧を取得するために使用
     """
-    # 認証チェック（必要に応じて有効化）
-    # authenticated_user = await get_authenticated_user(request)
-    # if not authenticated_user and not user_id:
-    #     raise HTTPException(status_code=401, detail="認証が必要です")
-
-    # 簡易実装: user_idをそのまま使用（実際の実装では認証ユーザーと照合）
-    target_user_id = user_id
+    authenticated_user = await get_authenticated_user(request)
+    auth_user_id = normalize_user_id(
+        str((authenticated_user or {}).get("sub") or "")
+    )
+    query_user_id = normalize_user_id(user_id)
+    target_user_id = auth_user_id or query_user_id
     if not target_user_id:
         raise HTTPException(status_code=400, detail="user_idパラメータが必要です")
+    if auth_user_id and query_user_id and auth_user_id != query_user_id:
+        raise HTTPException(
+            status_code=403, detail="指定user_idへのアクセスは許可されていません")
 
     logger.info(f"/api/user/sessions called for user_id={target_user_id}")
 
@@ -1079,8 +1128,10 @@ async def get_user_sessions(
     active_sessions = []
     current_time = time.time()
 
-    # _CONNECTION_TIMESTAMPSからアクティブなセッションを取得
+    # _CONNECTION_TIMESTAMPSから、対象ユーザーのアクティブなセッションのみ取得
     for conn_id, timestamp in list(_CONNECTION_TIMESTAMPS.items()):
+        if _CONNECTION_USER_INDEX.get(conn_id) != target_user_id:
+            continue
         # 1時間以内のセッションのみ返す
         if current_time - timestamp < 3600:
             result = _CONNECTION_RESULTS.get(conn_id)
@@ -1099,12 +1150,19 @@ async def get_user_sessions(
 
     return {
         "user_id": target_user_id,
-        "sessions": active_sessions
+        "sessions": active_sessions,
+        "has_latest_result": target_user_id in _USER_RESULTS,
+        "latest_result_pages": len(
+            (_USER_RESULTS.get(target_user_id) or {}).get("results", [])
+        ) if target_user_id in _USER_RESULTS else 0,
     }
 
 
 @app.middleware("http")
 async def require_login_for_app(request: Request, call_next):
+    if AUTH_DISABLED:
+        return await call_next(request)
+
     if OAUTH_CLIENT is None or request.method == "OPTIONS":
         return await call_next(request)
 
@@ -1184,12 +1242,31 @@ async def cancel(request_id: str) -> dict[str, Any]:
 @app.get("/api/latest_result")
 # session_id指定時（VB.NET連携）はセッション結果を返す。未指定時（ブラウザ単体）は直近の結果を返す。
 async def latest_result(
+    request: Request,
     connection_id: Optional[str] = Query(
         None, description="WebSocket接続ID（ブラウザインスタンス単位）"
     ),
     session_id: Optional[str] = Query(
         None, description="VB.NETアプリが発行したセッションID"),
+    user_id: Optional[str] = Query(
+        None, description="ログインユーザーID（Auth0 sub）"
+    ),
 ) -> dict[str, Any]:
+    authenticated_user = await get_authenticated_user(request)
+    auth_user_id = normalize_user_id(
+        str((authenticated_user or {}).get("sub") or "")
+    )
+    query_user_id = normalize_user_id(user_id)
+    target_user_id = auth_user_id or query_user_id
+    if auth_user_id and query_user_id and auth_user_id != query_user_id:
+        raise HTTPException(
+            status_code=403, detail="指定user_idへのアクセスは許可されていません")
+
+    if target_user_id:
+        result = _USER_RESULTS.get(target_user_id)
+        if result is not None:
+            return build_latest_result_payload(result)
+
     normalized_connection_id = normalize_connection_id(connection_id)
     if normalized_connection_id:
         result = _CONNECTION_RESULTS.get(normalized_connection_id)
@@ -1199,10 +1276,13 @@ async def latest_result(
             status_code=404, detail="指定connection_idの解析結果がありません")
 
     if session_id:
-        # VB.NET連携モード: セッションキーで検索、見つからなければ直近結果にフォールバック
+        # VB.NET連携モード: セッションキーで検索
         result = _SESSION_RESULTS.get(session_id)
         if result is not None:
             return build_latest_result_payload(result)
+        if target_user_id:
+            raise HTTPException(
+                status_code=404, detail="指定session_idの解析結果がありません")
         logger.info(
             "/api/latest_result: session_id=%s not found, falling back to latest", session_id)
         if _LATEST_RESULT is not None:
@@ -1236,6 +1316,7 @@ async def analyze(
     request_id: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
     connection_id: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
 ) -> dict[str, Any]:
     request_id = (request_id or "").strip() or uuid.uuid4().hex
     # session_idは Form または URL クエリパラメータのどちらからでも受け取る
@@ -1244,6 +1325,12 @@ async def analyze(
     raw_connection_id = connection_id or request.query_params.get(
         "connection_id")
     normalized_connection_id = normalize_connection_id(raw_connection_id)
+    authenticated_user = await get_authenticated_user(request)
+    auth_user_id = normalize_user_id(
+        str((authenticated_user or {}).get("sub") or "")
+    )
+    raw_user_id = user_id or request.query_params.get("user_id")
+    normalized_user_id = auth_user_id or normalize_user_id(raw_user_id)
     clear_cancel_request(request_id)
     set_progress(request_id, "preprocessing", "事前処理中", 0, 0)
 
@@ -1680,7 +1767,8 @@ async def analyze(
     clear_cancel_request(request_id)
 
     response = build_response("done", results)
-    # connection_id指定時（WebSocket連携）はそのキーで保存
+    # user_id指定時（ログインユーザー単位）はそのキーで保存
+    # connection_id指定時（WebSocket連携）はそのキーでも保存
     # session_id指定時（VB.NET連携）はそのキーでも保存
     # どちらも未指定時（ブラウザ単体）は最新で1件のみ上書き保存
     global _LATEST_RESULT
@@ -1693,6 +1781,8 @@ async def analyze(
             response,
             MAX_CONNECTION_ENTRIES,
         )
+        if normalized_user_id:
+            _CONNECTION_USER_INDEX[normalized_connection_id] = normalized_user_id
         stored = True
     if normalized_session_id:
         store_scoped_result(
@@ -1701,6 +1791,17 @@ async def analyze(
             normalized_session_id,
             response,
             MAX_SESSION_ENTRIES,
+        )
+        if normalized_user_id:
+            _SESSION_USER_INDEX[normalized_session_id] = normalized_user_id
+        stored = True
+    if normalized_user_id:
+        store_scoped_result(
+            _USER_RESULTS,
+            _USER_TIMESTAMPS,
+            normalized_user_id,
+            response,
+            MAX_USER_ENTRIES,
         )
         stored = True
     if not stored:
