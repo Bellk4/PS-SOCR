@@ -593,6 +593,27 @@
 				color: var(--muted);
 			}
 
+			.login-user-badge {
+				position: fixed;
+				right: 10px;
+				bottom: 10px;
+				z-index: 1200;
+				max-width: min(52vw, 420px);
+				padding: 4px 8px;
+				border-radius: 10px;
+				border: 1px solid rgba(0, 0, 0, 0.15);
+				background: rgba(255, 255, 255, 0.92);
+				box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16);
+				font-size: 10px;
+				line-height: 1.3;
+				font-family: var(--mono);
+				color: #5f6368;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				pointer-events: none;
+			}
+
 			/* Responsive */
 			@media (max-width: 1024px) {
 				.sidebar {
@@ -621,6 +642,13 @@
 				.thumb-panel {
 					width: 128px;
 					min-width: 128px;
+				}
+
+				.login-user-badge {
+					right: 8px;
+					bottom: 8px;
+					max-width: 78vw;
+					font-size: 9px;
 				}
 			}
 
@@ -1313,6 +1341,8 @@
 			</div>
 		</div>
 
+		<div id="loginUserBadge" class="login-user-badge" title="現在ログイン中のユーザーID">login: -</div>
+
 		<!-- Hidden elements for status -->
 		<div class="hidden">
 			<span id="statusModel">model: -</span>
@@ -1379,6 +1409,7 @@
 			const statusDevice = document.getElementById("statusDevice");
 			const statusCuda = document.getElementById("statusCuda");
 			const statusConnection = document.getElementById("statusConnection");
+			const loginUserBadge = document.getElementById("loginUserBadge");
 			const resultTask = document.getElementById("resultTask");
 			const resultLinebreak = document.getElementById("resultLinebreak");
 			const resultPages = document.getElementById("resultPages");
@@ -1405,6 +1436,9 @@
 			let _sessionSocketReconnectTimer = null;
 			// VB.NET起動時にURLパラメータで渡されるsession_id。ブラウザ単体起動時はnull。
 			const _vbnetSessionId = new URLSearchParams(window.location.search).get("session_id") || null;
+			// VB.NET起動時にURLパラメータで渡されるuser_id（ユーザー単位の結果管理用）。
+			const _vbnetUserId = new URLSearchParams(window.location.search).get("user_id") || null;
+			let _currentUserId = null;
 			let currentViewItem = null;
 			let currentViewLabel = "";
 			let copyFeedbackTimer = null;
@@ -2349,6 +2383,15 @@
 					if (statusModel) statusModel.textContent = `model: ${payload.model || "-"}`;
 					if (statusDevice) statusDevice.textContent = `device default: ${payload.device_default || "-"}`;
 					if (statusCuda) statusCuda.textContent = `cuda: ${String(payload.cuda_available)}`;
+					if (loginUserBadge) {
+						loginUserBadge.textContent = `login: ${payload.current_user_id || "-"}`;
+						_currentUserId = payload.current_user_id || null;
+						if (payload.current_user_id) {
+							loginUserBadge.title = `現在ログイン中のユーザーID: ${payload.current_user_id}`;
+						} else {
+							loginUserBadge.title = "現在ログイン中のユーザーID";
+						}
+					}
 					if (logoutBtn) {
 						if (payload.oauth_enabled) {
 							if (accountSection) accountSection.classList.remove("hidden");
@@ -2376,6 +2419,8 @@
 					}
 				} catch (error) {
 					if (statusCuda) statusCuda.textContent = "cuda: status unavailable";
+					_currentUserId = null;
+					if (loginUserBadge) loginUserBadge.textContent = "login: -";
 					if (accountSection) accountSection.classList.add("hidden");
 					if (logoutToolbarBtn) logoutToolbarBtn.classList.add("hidden");
 				}
@@ -2761,6 +2806,11 @@
 				formData.append("request_id", requestId);
 				if (_vbnetSessionId) {
 					formData.append("session_id", _vbnetSessionId);
+				}
+				if (_vbnetUserId) {
+					formData.append("user_id", _vbnetUserId);
+				} else if (_currentUserId) {
+					formData.append("user_id", _currentUserId);
 				}
 				if (_wsConnectionId) {
 					formData.append("connection_id", _wsConnectionId);

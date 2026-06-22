@@ -13,6 +13,7 @@ from typing import Any, Optional, cast
 
 import torch
 import httpx
+from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     File,
@@ -45,6 +46,7 @@ from .oauth_integration import (
 
 MODEL_ID = "zai-org/GLM-OCR"
 ROOT_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT_DIR / ".env")
 MODEL_CACHE_DIR = Path(
     os.getenv("GLM_MODEL_CACHE", str(ROOT_DIR / "models" / "hf_cache"))
 )
@@ -65,6 +67,9 @@ AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "").strip()
 AUTH0_USERINFO_URL = f"https://{AUTH0_DOMAIN}/userinfo" if AUTH0_DOMAIN else ""
 AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").strip().lower() in {
     "1", "true", "yes", "on"}
+ALLOW_USER_ID_QUERY_WITHOUT_BEARER = os.getenv(
+    "ALLOW_USER_ID_QUERY_WITHOUT_BEARER", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 logger = logging.getLogger("glm_ocr_server")
 logging.basicConfig(level=logging.INFO,
@@ -729,6 +734,39 @@ def store_scoped_result(
         timestamps.pop(old_key, None)
 
 
+def _find_latest_result_for_user_from_scoped_indexes(
+    user_id: str,
+) -> Optional[dict[str, Any]]:
+    latest_key: Optional[str] = None
+    latest_ts: float = -1.0
+
+    for conn_id, owner_id in _CONNECTION_USER_INDEX.items():
+        if owner_id != user_id:
+            continue
+        ts = _CONNECTION_TIMESTAMPS.get(conn_id, 0.0)
+        if ts > latest_ts and conn_id in _CONNECTION_RESULTS:
+            latest_ts = ts
+            latest_key = conn_id
+
+    if latest_key is not None:
+        return _CONNECTION_RESULTS.get(latest_key)
+
+    latest_session_key: Optional[str] = None
+    latest_session_ts: float = -1.0
+    for session_id, owner_id in _SESSION_USER_INDEX.items():
+        if owner_id != user_id:
+            continue
+        ts = _SESSION_TIMESTAMPS.get(session_id, 0.0)
+        if ts > latest_session_ts and session_id in _SESSION_RESULTS:
+            latest_session_ts = ts
+            latest_session_key = session_id
+
+    if latest_session_key is not None:
+        return _SESSION_RESULTS.get(latest_session_key)
+
+    return None
+
+
 LISTVIEW_COLUMNS = ["品番", "部品名", "材質", "処理", "個数"]
 
 
@@ -1170,6 +1208,14 @@ async def require_login_for_app(request: Request, call_next):
     if is_oauth_public_path(path):
         return await call_next(request)
 
+    # 社内連携用途: Bearerなしでも user_id 指定で latest_result を許可するオプション
+    if (
+        ALLOW_USER_ID_QUERY_WITHOUT_BEARER
+        and path == "/api/latest_result"
+        and normalize_user_id(request.query_params.get("user_id"))
+    ):
+        return await call_next(request)
+
     user = await get_authenticated_user(request)
     if user:
         return await call_next(request)
@@ -1213,7 +1259,11 @@ async def index() -> HTMLResponse:
 
 @app.get("/api/status")
 # 実行環境状態（CUDA可否・既定デバイス・モデル情報）を返す。
-async def status() -> dict[str, Any]:
+async def status(request: Request) -> dict[str, Any]:
+    authenticated_user = await get_authenticated_user(request)
+    current_user_id = normalize_user_id(
+        str((authenticated_user or {}).get("sub") or "")
+    ) or None
     return {
         "cuda_available": torch.cuda.is_available(),
         "device_default": "cuda" if torch.cuda.is_available() else "cpu",
@@ -1221,6 +1271,7 @@ async def status() -> dict[str, Any]:
         "model_cache_dir": str(MODEL_CACHE_DIR),
         "oauth_enabled": OAUTH_CLIENT is not None,
         "oauth_base_path": OAUTH_BASE_PATH if OAUTH_CLIENT is not None else None,
+        "current_user_id": current_user_id,
     }
 
 
@@ -1257,6 +1308,19 @@ async def latest_result(
         str((authenticated_user or {}).get("sub") or "")
     )
     query_user_id = normalize_user_id(user_id)
+
+    # Bearerなし運用時は user_id 指定を必須にし、他スコープへのフォールバックを禁止
+    if (
+        not AUTH_DISABLED
+        and ALLOW_USER_ID_QUERY_WITHOUT_BEARER
+        and not auth_user_id
+        and not query_user_id
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer未使用モードでは user_id パラメータが必要です",
+        )
+
     target_user_id = auth_user_id or query_user_id
     if auth_user_id and query_user_id and auth_user_id != query_user_id:
         raise HTTPException(
@@ -1266,6 +1330,24 @@ async def latest_result(
         result = _USER_RESULTS.get(target_user_id)
         if result is not None:
             return build_latest_result_payload(result)
+        scoped_result = _find_latest_result_for_user_from_scoped_indexes(
+            target_user_id
+        )
+        if scoped_result is not None:
+            return build_latest_result_payload(scoped_result)
+        if (
+            ALLOW_USER_ID_QUERY_WITHOUT_BEARER
+            and query_user_id
+            and not auth_user_id
+            and _LATEST_RESULT is not None
+        ):
+            logger.warning(
+                "/api/latest_result: user_id=%s の専用結果が無いため latest を返却します",
+                target_user_id,
+            )
+            return build_latest_result_payload(_LATEST_RESULT)
+        if query_user_id or (ALLOW_USER_ID_QUERY_WITHOUT_BEARER and not auth_user_id):
+            raise HTTPException(status_code=404, detail="指定user_idの解析結果がありません")
 
     normalized_connection_id = normalize_connection_id(connection_id)
     if normalized_connection_id:
@@ -1330,7 +1412,13 @@ async def analyze(
         str((authenticated_user or {}).get("sub") or "")
     )
     raw_user_id = user_id or request.query_params.get("user_id")
-    normalized_user_id = auth_user_id or normalize_user_id(raw_user_id)
+    query_user_id = normalize_user_id(raw_user_id)
+    if auth_user_id and query_user_id and auth_user_id != query_user_id:
+        raise HTTPException(
+            status_code=403, detail="指定user_idへのアクセスは許可されていません"
+        )
+    # ログイン時はAuth0ユーザーID、未ログイン時は明示user_idを採用
+    normalized_user_id = auth_user_id or query_user_id
     clear_cancel_request(request_id)
     set_progress(request_id, "preprocessing", "事前処理中", 0, 0)
 
@@ -1804,6 +1892,6 @@ async def analyze(
             MAX_USER_ENTRIES,
         )
         stored = True
-    if not stored:
-        _LATEST_RESULT = response
+    # user_id/connection/session 保存有無に関係なく、最新結果ミラーは更新する
+    _LATEST_RESULT = response
     return response
