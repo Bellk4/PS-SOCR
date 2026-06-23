@@ -767,6 +767,33 @@ def _find_latest_result_for_user_from_scoped_indexes(
     return None
 
 
+def _find_latest_result_from_any_scope() -> Optional[dict[str, Any]]:
+    latest_result: Optional[dict[str, Any]] = None
+    latest_ts: float = -1.0
+
+    for conn_id, ts in _CONNECTION_TIMESTAMPS.items():
+        if ts <= latest_ts:
+            continue
+        result = _CONNECTION_RESULTS.get(conn_id)
+        if result is None:
+            continue
+        latest_result = result
+        latest_ts = ts
+
+    for session_id, ts in _SESSION_TIMESTAMPS.items():
+        if ts <= latest_ts:
+            continue
+        result = _SESSION_RESULTS.get(session_id)
+        if result is None:
+            continue
+        latest_result = result
+        latest_ts = ts
+
+    if latest_result is not None:
+        return latest_result
+    return _LATEST_RESULT
+
+
 LISTVIEW_COLUMNS = ["品番", "部品名", "材質", "処理", "個数"]
 
 
@@ -938,6 +965,14 @@ def build_latest_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         },
         "listview_rows": listview_rows,
     }
+
+
+def _result_belongs_to_user(result: Optional[dict[str, Any]], user_id: str) -> bool:
+    if result is None:
+        return False
+    owner_user_id = normalize_user_id(
+        cast(Optional[str], result.get("user_id")))
+    return owner_user_id == user_id
 
 # リクエスト進捗状態を保存し、上限を超えた古い履歴を間引く。
 
@@ -1213,6 +1248,9 @@ async def require_login_for_app(request: Request, call_next):
         ALLOW_USER_ID_QUERY_WITHOUT_BEARER
         and path == "/api/latest_result"
         and normalize_user_id(request.query_params.get("user_id"))
+        and not request.headers.get("Origin")
+        and not request.headers.get("Referer")
+        and not has_local_oauth_session(request)
     ):
         return await call_next(request)
 
@@ -1304,15 +1342,23 @@ async def latest_result(
     ),
 ) -> dict[str, Any]:
     authenticated_user = await get_authenticated_user(request)
+    has_local_session = OAUTH_CLIENT is not None and has_local_oauth_session(
+        request)
     auth_user_id = normalize_user_id(
         str((authenticated_user or {}).get("sub") or "")
     )
     query_user_id = normalize_user_id(user_id)
 
+    # ログインセッションがあるブラウザでは、未認証扱いでの user_id 参照を許可しない。
+    if has_local_session and query_user_id and not auth_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="ログインセッションの検証に失敗しました。再ログインしてください",
+        )
+
     # Bearerなし運用時は user_id 指定を必須にし、他スコープへのフォールバックを禁止
     if (
-        not AUTH_DISABLED
-        and ALLOW_USER_ID_QUERY_WITHOUT_BEARER
+        ALLOW_USER_ID_QUERY_WITHOUT_BEARER
         and not auth_user_id
         and not query_user_id
     ):
@@ -1335,19 +1381,10 @@ async def latest_result(
         )
         if scoped_result is not None:
             return build_latest_result_payload(scoped_result)
-        if (
-            ALLOW_USER_ID_QUERY_WITHOUT_BEARER
-            and query_user_id
-            and not auth_user_id
-            and _LATEST_RESULT is not None
-        ):
-            logger.warning(
-                "/api/latest_result: user_id=%s の専用結果が無いため latest を返却します",
-                target_user_id,
-            )
-            return build_latest_result_payload(_LATEST_RESULT)
-        if query_user_id or (ALLOW_USER_ID_QUERY_WITHOUT_BEARER and not auth_user_id):
-            raise HTTPException(status_code=404, detail="指定user_idの解析結果がありません")
+        if _result_belongs_to_user(_LATEST_RESULT, target_user_id):
+            return build_latest_result_payload(cast(dict[str, Any], _LATEST_RESULT))
+        # user_id指定時は他スコープへフォールバックせず、ユーザー結果のみ返す。
+        raise HTTPException(status_code=404, detail="指定user_idの解析結果がありません")
 
     normalized_connection_id = normalize_connection_id(connection_id)
     if normalized_connection_id:
@@ -1416,6 +1453,13 @@ async def analyze(
     if auth_user_id and query_user_id and auth_user_id != query_user_id:
         raise HTTPException(
             status_code=403, detail="指定user_idへのアクセスは許可されていません"
+        )
+    # Bearerなし運用時は解析時にも user_id を必須化する。
+    # これにより user_id 未保存のまま latest_result が404になる取りこぼしを防ぐ。
+    if ALLOW_USER_ID_QUERY_WITHOUT_BEARER and not auth_user_id and not query_user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer未使用モードでは user_id パラメータが必要です",
         )
     # ログイン時はAuth0ユーザーID、未ログイン時は明示user_idを採用
     normalized_user_id = auth_user_id or query_user_id
@@ -1576,6 +1620,9 @@ async def analyze(
     def build_response(state: str, response_results: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "request_id": request_id,
+            "user_id": normalized_user_id,
+            "session_id": normalized_session_id,
+            "connection_id": normalized_connection_id,
             "device": actual_device,
             "task": normalized_task,
             "linebreak_mode": normalized_linebreak_mode,

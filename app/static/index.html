@@ -1513,9 +1513,13 @@
 				return typeof value === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value);
 			}
 
+			function isUserScopedMode() {
+				return Boolean(_vbnetUserId || _currentUserId);
+			}
+
 			function syncConnectionIdToUrl() {
 				const currentUrl = new URL(window.location.href);
-				if (isValidConnectionId(_wsConnectionId)) {
+				if (!isUserScopedMode() && isValidConnectionId(_wsConnectionId)) {
 					currentUrl.searchParams.set("connection_id", _wsConnectionId);
 					if (statusConnection) statusConnection.textContent = `connection_id: ${_wsConnectionId}`;
 				} else {
@@ -2386,6 +2390,7 @@
 					if (loginUserBadge) {
 						loginUserBadge.textContent = `login: ${payload.current_user_id || "-"}`;
 						_currentUserId = payload.current_user_id || null;
+						syncConnectionIdToUrl();
 						if (payload.current_user_id) {
 							loginUserBadge.title = `現在ログイン中のユーザーID: ${payload.current_user_id}`;
 						} else {
@@ -2813,7 +2818,9 @@
 					formData.append("user_id", _currentUserId);
 				}
 				if (_wsConnectionId) {
-					formData.append("connection_id", _wsConnectionId);
+					if (!isUserScopedMode()) {
+						formData.append("connection_id", _wsConnectionId);
+					}
 				}
 				
 				if (taskNeedsSchema(taskInput.value)) {
